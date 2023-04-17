@@ -7,50 +7,54 @@ release:
 
 before:
   hooks:
-    - go mod tidy
     - make manpages GH_VERSION={{.Version}}
 
 builds:
-  - <<: &build_defaults
-      binary: bin/gh
-      main: ./cmd/gh
-      ldflags:
-        - -s -w -X github.com/cli/cli/v2/internal/build.Version={{.Version}} -X github.com/cli/cli/v2/internal/build.Date={{time "2006-01-02"}}
-    id: macos
+  - id: macos
     goos: [darwin]
     goarch: [amd64, arm64]
+    binary: bin/gh
+    main: ./cmd/gh
+    ldflags:
+      - -s -w -X github.com/cli/cli/v2/internal/build.Version={{.Version}} -X github.com/cli/cli/v2/internal/build.Date={{time "2006-01-02"}}
 
-  - <<: *build_defaults
-    id: linux
+  - id: linux
     goos: [linux]
     goarch: [386, arm, amd64, arm64]
     env:
       - CGO_ENABLED=0
+    binary: bin/gh
+    main: ./cmd/gh
+    ldflags:
+      - -s -w -X github.com/cli/cli/v2/internal/build.Version={{.Version}} -X github.com/cli/cli/v2/internal/build.Date={{time "2006-01-02"}}
 
-  - <<: *build_defaults
-    id: windows
+  - id: windows
     goos: [windows]
     goarch: [386, amd64, arm64]
     hooks:
       post:
         - cmd: ./script/sign-windows-executable.sh '{{ .Path }}'
           output: false
+    binary: bin/gh
+    main: ./cmd/gh
+    ldflags:
+      - -s -w -X github.com/cli/cli/v2/internal/build.Version={{.Version}} -X github.com/cli/cli/v2/internal/build.Date={{time "2006-01-02"}}
 
 archives:
-  - id: nix
+  - id: nix-archive
     builds: [macos, linux]
-    <<: &archive_defaults
-      name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    name_template: >-
+      gh_{{ .Version }}_
+      {{- if eq .Os "darwin" }}macOS{{ else }}linux{{ end }}_
+      {{- .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}
     wrap_in_directory: true
-    replacements:
-      darwin: macOS
     format: tar.gz
     files:
       - LICENSE
       - ./share/man/man1/gh*.1
-  - id: windows
+  - id: win-archive
     builds: [windows]
-    <<: *archive_defaults
+    name_template: "gh_{{ .Version }}_windows_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
     wrap_in_directory: false
     format: zip
     files:

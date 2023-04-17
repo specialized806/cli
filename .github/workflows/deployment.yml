@@ -1,0 +1,119 @@
+name: Deployment
+
+concurrency: 
+  group: production
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+      go_version:
+        default: "1.19"
+        type: string
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ inputs.go_version }}
+      - name: Configure GoReleaser
+        run: |
+          touch CHANGELOG.md
+          sed '/- id: windows$/,/^$/d; /- id: macos$/,/^$/d' .goreleaser.yml >.goreleaser.generated.yml
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v4
+        with:
+          version: "~1.17.1"
+          args: release -f .goreleaser.generated.yml --skip-publish --release-notes=CHANGELOG.md
+        env:
+          GORELEASER_CURRENT_TAG: ${{ inputs.tag_name }}
+      - name: Generate web manual pages
+        run: |
+          go run ./cmd/gen-docs --website --doc-path dist/manual
+          tar -czf dist/manual.tar.gz -C dist -- manual
+      - uses: actions/upload-artifact@v3
+        with:
+          name: linux
+          path: |
+            dist/*.tar.gz
+            dist/*.rpm
+            dist/*.deb
+  
+  macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ inputs.go_version }}
+      - name: Configure GoReleaser
+        run: |
+          touch CHANGELOG.md
+          sed '/- id: windows$/,/^$/d; /- id: linux$/,/^$/d; /^nfpms/,/^$/d' .goreleaser.yml >.goreleaser.generated.yml
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v4
+        with:
+          version: "~1.17.1"
+          args: release -f .goreleaser.generated.yml --skip-publish --release-notes=CHANGELOG.md
+        env:
+          GORELEASER_CURRENT_TAG: ${{ inputs.tag_name }}
+      - uses: actions/upload-artifact@v3
+        with:
+          name: macos
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+  
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ inputs.go_version }}
+      - name: Configure GoReleaser
+        shell: bash
+        run: |
+          touch CHANGELOG.md
+          sed '/- id: macos$/,/^$/d; /- id: linux$/,/^$/d; /^nfpms/,/^$/d' .goreleaser.yml >.goreleaser.generated.yml
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v4
+        with:
+          version: "~1.17.1"
+          args: release -f .goreleaser.generated.yml --skip-publish --release-notes=CHANGELOG.md
+        env:
+          GORELEASER_CURRENT_TAG: ${{ inputs.tag_name }}
+      - name: Set up MSBuild
+        id: setupmsbuild
+        uses: microsoft/setup-msbuild@v1.3.1
+      - name: Build MSI
+        id: buildmsi
+        shell: bash
+        env:
+          ZIP_FILE: dist/gh_${{ inputs.tag_name }}_windows_amd64.zip
+          MSBUILD_PATH: ${{ steps.setupmsbuild.outputs.msbuildPath }}
+          MSI_VERSION: ${{ inputs.tag_name }}
+        run: |
+          unzip -o "$ZIP_FILE"
+          "${MSBUILD_PATH}\MSBuild.exe" ./build/windows/gh.wixproj -p:SourceDir="$PWD" -p:OutputPath="$PWD\dist" -p:OutputName="$(basename "$ZIP_FILE" ".zip")" -p:ProductVersion="$MSI_VERSION"
+      - uses: actions/upload-artifact@v3
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/*.msi
