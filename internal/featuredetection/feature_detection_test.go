@@ -5,8 +5,10 @@ import (
 	"testing"
 
 	"github.com/MakeNowJust/heredoc"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/pkg/httpmock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIssueFeatures(t *testing.T) {
@@ -21,7 +23,17 @@ func TestIssueFeatures(t *testing.T) {
 			name:     "github.com",
 			hostname: "github.com",
 			wantFeatures: IssueFeatures{
-				StateReason: true,
+				StateReason:       true,
+				ActorIsAssignable: true,
+			},
+			wantErr: false,
+		},
+		{
+			name:     "ghec data residency (ghe.com)",
+			hostname: "stampname.ghe.com",
+			wantFeatures: IssueFeatures{
+				StateReason:       true,
+				ActorIsAssignable: true,
 			},
 			wantErr: false,
 		},
@@ -32,7 +44,8 @@ func TestIssueFeatures(t *testing.T) {
 				`query Issue_fields\b`: `{"data": {}}`,
 			},
 			wantFeatures: IssueFeatures{
-				StateReason: false,
+				StateReason:       false,
+				ActorIsAssignable: false,
 			},
 			wantErr: false,
 		},
@@ -82,21 +95,43 @@ func TestPullRequestFeatures(t *testing.T) {
 		wantErr       bool
 	}{
 		{
-			name:     "github.com",
+			name:     "github.com with all features",
 			hostname: "github.com",
 			queryResponse: map[string]string{
 				`query PullRequest_fields\b`: heredoc.Doc(`
-					{ "data": { "PullRequest": { "fields": [
-						{"name": "isInMergeQueue"},
-						{"name": "isMergeQueueEnabled"}
-					] } } }
-				`),
+				{
+					"data": {
+						"PullRequest": {
+							"fields": [
+								{"name": "isInMergeQueue"},
+								{"name": "isMergeQueueEnabled"}
+							]
+						},
+						"StatusCheckRollupContextConnection": {
+							"fields": [
+								{"name": "checkRunCount"},
+								{"name": "checkRunCountsByState"},
+								{"name": "statusContextCount"},
+								{"name": "statusContextCountsByState"}
+							]
+						}
+					}
+				}`),
+				`query PullRequest_fields2\b`: heredoc.Doc(`
+				{
+					"data": {
+						"WorkflowRun": {
+							"fields": [
+								{"name": "event"}
+							]
+						}
+					}
+				}`),
 			},
 			wantFeatures: PullRequestFeatures{
-				ReviewDecision:       true,
-				StatusCheckRollup:    true,
-				BranchProtectionRule: true,
-				MergeQueue:           true,
+				MergeQueue:                     true,
+				CheckRunAndStatusContextCounts: true,
+				CheckRunEvent:                  true,
 			},
 			wantErr: false,
 		},
@@ -105,34 +140,108 @@ func TestPullRequestFeatures(t *testing.T) {
 			hostname: "github.com",
 			queryResponse: map[string]string{
 				`query PullRequest_fields\b`: heredoc.Doc(`
-					{ "data": { "PullRequest": { "fields": [
-					] } } }
-				`),
+				{
+					"data": {
+						"PullRequest": {
+							"fields": []
+						},
+						"StatusCheckRollupContextConnection": {
+							"fields": [
+								{"name": "checkRunCount"},
+								{"name": "checkRunCountsByState"},
+								{"name": "statusContextCount"},
+								{"name": "statusContextCountsByState"}
+							]
+						}
+					}
+				}`),
+				`query PullRequest_fields2\b`: heredoc.Doc(`
+				{
+					"data": {
+						"WorkflowRun": {
+							"fields": [
+								{"name": "event"}
+							]
+						}
+					}
+				}`),
 			},
 			wantFeatures: PullRequestFeatures{
-				ReviewDecision:       true,
-				StatusCheckRollup:    true,
-				BranchProtectionRule: true,
-				MergeQueue:           false,
+				MergeQueue:                     false,
+				CheckRunAndStatusContextCounts: true,
+				CheckRunEvent:                  true,
 			},
 			wantErr: false,
 		},
 		{
-			name:     "GHE",
+			name:     "GHE with all features",
 			hostname: "git.my.org",
 			queryResponse: map[string]string{
 				`query PullRequest_fields\b`: heredoc.Doc(`
-					{ "data": { "PullRequest": { "fields": [
-						{"name": "isInMergeQueue"},
-						{"name": "isMergeQueueEnabled"}
-					] } } }
-				`),
+				{
+					"data": {
+						"PullRequest": {
+							"fields": [
+								{"name": "isInMergeQueue"},
+								{"name": "isMergeQueueEnabled"}
+							]
+						},
+						"StatusCheckRollupContextConnection": {
+							"fields": [
+								{"name": "checkRunCount"},
+								{"name": "checkRunCountsByState"},
+								{"name": "statusContextCount"},
+								{"name": "statusContextCountsByState"}
+							]
+						}
+					}
+				}`),
+				`query PullRequest_fields2\b`: heredoc.Doc(`
+				{
+					"data": {
+						"WorkflowRun": {
+							"fields": [
+								{"name": "event"}
+							]
+						}
+					}
+				}`),
 			},
 			wantFeatures: PullRequestFeatures{
-				ReviewDecision:       true,
-				StatusCheckRollup:    true,
-				BranchProtectionRule: true,
-				MergeQueue:           true,
+				MergeQueue:                     true,
+				CheckRunAndStatusContextCounts: true,
+				CheckRunEvent:                  true,
+			},
+			wantErr: false,
+		},
+		{
+			name:     "GHE with no features",
+			hostname: "git.my.org",
+			queryResponse: map[string]string{
+				`query PullRequest_fields\b`: heredoc.Doc(`
+				{
+					"data": {
+						"PullRequest": {
+							"fields": []
+						},
+						"StatusCheckRollupContextConnection": {
+							"fields": []
+						}
+					}
+				}`),
+				`query PullRequest_fields2\b`: heredoc.Doc(`
+				{
+					"data": {
+						"WorkflowRun": {
+							"fields": []
+						}
+					}
+				}`),
+			},
+			wantFeatures: PullRequestFeatures{
+				MergeQueue:                     false,
+				CheckRunAndStatusContextCounts: false,
+				CheckRunEvent:                  false,
 			},
 			wantErr: false,
 		},
@@ -169,8 +278,16 @@ func TestRepositoryFeatures(t *testing.T) {
 			name:     "github.com",
 			hostname: "github.com",
 			wantFeatures: RepositoryFeatures{
-				IssueTemplateMutation:    true,
-				IssueTemplateQuery:       true,
+				PullRequestTemplateQuery: true,
+				VisibilityField:          true,
+				AutoMerge:                true,
+			},
+			wantErr: false,
+		},
+		{
+			name:     "ghec data residency (ghe.com)",
+			hostname: "stampname.ghe.com",
+			wantFeatures: RepositoryFeatures{
 				PullRequestTemplateQuery: true,
 				VisibilityField:          true,
 				AutoMerge:                true,
@@ -184,8 +301,6 @@ func TestRepositoryFeatures(t *testing.T) {
 				`query Repository_fields\b`: `{"data": {}}`,
 			},
 			wantFeatures: RepositoryFeatures{
-				IssueTemplateMutation:    true,
-				IssueTemplateQuery:       true,
 				PullRequestTemplateQuery: false,
 			},
 			wantErr: false,
@@ -201,8 +316,6 @@ func TestRepositoryFeatures(t *testing.T) {
 				`),
 			},
 			wantFeatures: RepositoryFeatures{
-				IssueTemplateMutation:    true,
-				IssueTemplateQuery:       true,
 				PullRequestTemplateQuery: true,
 			},
 			wantErr: false,
@@ -218,9 +331,7 @@ func TestRepositoryFeatures(t *testing.T) {
 				`),
 			},
 			wantFeatures: RepositoryFeatures{
-				IssueTemplateMutation: true,
-				IssueTemplateQuery:    true,
-				VisibilityField:       true,
+				VisibilityField: true,
 			},
 			wantErr: false,
 		},
@@ -235,9 +346,7 @@ func TestRepositoryFeatures(t *testing.T) {
 				`),
 			},
 			wantFeatures: RepositoryFeatures{
-				IssueTemplateMutation: true,
-				IssueTemplateQuery:    true,
-				AutoMerge:             true,
+				AutoMerge: true,
 			},
 			wantErr: false,
 		},
@@ -261,4 +370,20 @@ func TestRepositoryFeatures(t *testing.T) {
 			assert.Equal(t, tt.wantFeatures, gotFeatures)
 		})
 	}
+}
+
+func TestProjectV1Support(t *testing.T) {
+	t.Parallel()
+
+	t.Run("when the host is enterprise, project v1 is supported", func(t *testing.T) {
+		detector := detector{host: "my.ghes.com"}
+		isProjectV1Supported := detector.ProjectsV1()
+		require.Equal(t, gh.ProjectsV1Supported, isProjectV1Supported)
+	})
+
+	t.Run("when the host is not enterprise, project v1 is not supported", func(t *testing.T) {
+		detector := detector{host: "github.com"}
+		isProjectV1Supported := detector.ProjectsV1()
+		require.Equal(t, gh.ProjectsV1Unsupported, isProjectV1Supported)
+	})
 }

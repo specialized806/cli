@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -36,13 +37,14 @@ type BrowseOptions struct {
 
 	SelectorArg string
 
-	Branch        string
-	Commit        string
-	ProjectsFlag  bool
-	ReleasesFlag  bool
-	SettingsFlag  bool
-	WikiFlag      bool
-	NoBrowserFlag bool
+	Branch          string
+	Commit          string
+	ProjectsFlag    bool
+	ReleasesFlag    bool
+	SettingsFlag    bool
+	WikiFlag        bool
+	NoBrowserFlag   bool
+	HasRepoOverride bool
 }
 
 func NewCmdBrowse(f *cmdutil.Factory, runF func(*BrowseOptions) error) *cobra.Command {
@@ -57,31 +59,42 @@ func NewCmdBrowse(f *cmdutil.Factory, runF func(*BrowseOptions) error) *cobra.Co
 	}
 
 	cmd := &cobra.Command{
-		Long:  "Open the GitHub repository in the web browser.",
-		Short: "Open the repository in the browser",
-		Use:   "browse [<number> | <path> | <commit-SHA>]",
-		Args:  cobra.MaximumNArgs(1),
+		Short: "Open repositories, issues, pull requests, and more in the browser",
+		Long: heredoc.Doc(`
+			Transition from the terminal to the web browser to view and interact with:
+
+			- Issues
+			- Pull requests
+			- Repository content
+			- Repository home page
+			- Repository settings
+		`),
+		Use:  "browse [<number> | <path> | <commit-sha>]",
+		Args: cobra.MaximumNArgs(1),
 		Example: heredoc.Doc(`
+			# Open the home page of the current repository
 			$ gh browse
-			#=> Open the home page of the current repository
 
+			# Open the script directory of the current repository
+			$ gh browse script/
+
+			# Open issue or pull request 217
 			$ gh browse 217
-			#=> Open issue or pull request 217
 
+			# Open commit page
 			$ gh browse 77507cd94ccafcf568f8560cfecde965fcfa63
-			#=> Open commit page
 
+			# Open repository settings
 			$ gh browse --settings
-			#=> Open repository settings
 
+			# Open main.go at line 312
 			$ gh browse main.go:312
-			#=> Open main.go at line 312
 
+			# Open main.go with the repository at head of bug-fix branch
 			$ gh browse main.go --branch bug-fix
-			#=> Open main.go with the repository at head of bug-fix branch
 
+			# Open main.go with the repository at commit 775007cd
 			$ gh browse main.go --commit=77507cd94ccafcf568f8560cfecde965fcfa63
-			#=> Open main.go with the repository at commit 775007cd
 		`),
 		Annotations: map[string]string{
 			"help:arguments": heredoc.Doc(`
@@ -129,8 +142,9 @@ func NewCmdBrowse(f *cmdutil.Factory, runF func(*BrowseOptions) error) *cobra.Co
 				return cmdutil.FlagErrorf("%q is an invalid argument when using `--branch` or `--commit`", opts.SelectorArg)
 			}
 
-			if cmd.Flags().Changed("repo") {
+			if cmd.Flags().Changed("repo") || os.Getenv("GH_REPO") != "" {
 				opts.GitClient = &remoteGitClient{opts.BaseRepo, opts.HttpClient}
+				opts.HasRepoOverride = true
 			}
 
 			if runF != nil {
@@ -163,14 +177,12 @@ func runBrowse(opts *BrowseOptions) error {
 		return fmt.Errorf("unable to determine base repository: %w", err)
 	}
 
-	if opts.Commit != "" {
-		if opts.Commit == emptyCommitFlag {
-			commit, err := opts.GitClient.LastCommit()
-			if err != nil {
-				return err
-			}
-			opts.Commit = commit.Sha
+	if opts.Commit != "" && opts.Commit == emptyCommitFlag {
+		commit, err := opts.GitClient.LastCommit()
+		if err != nil {
+			return err
 		}
+		opts.Commit = commit.Sha
 	}
 
 	section, err := parseSection(baseRepo, opts)
@@ -180,7 +192,19 @@ func runBrowse(opts *BrowseOptions) error {
 	url := ghrepo.GenerateRepoURL(baseRepo, "%s", section)
 
 	if opts.NoBrowserFlag {
-		_, err := fmt.Fprintln(opts.IO.Out, url)
+		client, err := opts.HttpClient()
+		if err != nil {
+			return err
+		}
+
+		exist, err := api.RepoExists(api.NewClientFromHTTP(client), baseRepo)
+		if err != nil {
+			return err
+		}
+		if !exist {
+			return fmt.Errorf("%s doesn't exist", text.DisplayURL(url))
+		}
+		_, err = fmt.Fprintln(opts.IO.Out, url)
 		return err
 	}
 
@@ -265,7 +289,7 @@ func parseFile(opts BrowseOptions, f string) (p string, start int, end int, err 
 	}
 
 	p = filepath.ToSlash(parts[0])
-	if !path.IsAbs(p) {
+	if !path.IsAbs(p) && !opts.HasRepoOverride {
 		p = path.Join(opts.PathFromRepoRoot(), p)
 		if p == "." || strings.HasPrefix(p, "..") {
 			p = ""

@@ -3,10 +3,12 @@ package edit
 import (
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/config"
+	fd "github.com/cli/cli/v2/internal/featuredetection"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	shared "github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
@@ -24,6 +26,9 @@ type EditOptions struct {
 	Surveyor        Surveyor
 	Fetcher         EditableOptionsFetcher
 	EditorRetriever EditorRetriever
+	Prompter        shared.EditPrompter
+	Detector        fd.Detector
+	BaseRepo        func() (ghrepo.Interface, error)
 
 	SelectorArg string
 	Interactive bool
@@ -35,39 +40,68 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(*EditOptions) error) *cobra.Comman
 	opts := &EditOptions{
 		IO:              f.IOStreams,
 		HttpClient:      f.HttpClient,
-		Surveyor:        surveyor{},
+		Surveyor:        surveyor{P: f.Prompter},
 		Fetcher:         fetcher{},
 		EditorRetriever: editorRetriever{config: f.Config},
+		Prompter:        f.Prompter,
 	}
 
 	var bodyFile string
+	var removeMilestone bool
 
 	cmd := &cobra.Command{
 		Use:   "edit [<number> | <url> | <branch>]",
 		Short: "Edit a pull request",
-		Long: heredoc.Doc(`
+		Long: heredoc.Docf(`
 			Edit a pull request.
 
 			Without an argument, the pull request that belongs to the current branch
 			is selected.
 
-			Editing a pull request's projects requires authorization with the "project" scope.
-			To authorize, run "gh auth refresh -s project".
-		`),
+			Editing a pull request's projects requires authorization with the %[1]sproject%[1]s scope.
+			To authorize, run %[1]sgh auth refresh -s project%[1]s.
+
+			The %[1]s--add-assignee%[1]s and %[1]s--remove-assignee%[1]s flags both support
+			the following special values:
+			- %[1]s@me%[1]s: assign or unassign yourself
+			- %[1]s@copilot%[1]s: assign or unassign Copilot (not supported on GitHub Enterprise Server)
+
+			The %[1]s--add-reviewer%[1]s and %[1]s--remove-reviewer%[1]s flags do not support
+			these special values.
+		`, "`"),
 		Example: heredoc.Doc(`
 			$ gh pr edit 23 --title "I found a bug" --body "Nothing works"
 			$ gh pr edit 23 --add-label "bug,help wanted" --remove-label "core"
 			$ gh pr edit 23 --add-reviewer monalisa,hubot  --remove-reviewer myorg/team-name
 			$ gh pr edit 23 --add-assignee "@me" --remove-assignee monalisa,hubot
+			$ gh pr edit 23 --add-assignee "@copilot"
 			$ gh pr edit 23 --add-project "Roadmap" --remove-project v1,v2
 			$ gh pr edit 23 --milestone "Version 1"
+			$ gh pr edit 23 --remove-milestone
 		`),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.Finder = shared.NewFinder(f)
 
+			// support `-R, --repo` override
+			opts.BaseRepo = f.BaseRepo
+
 			if len(args) > 0 {
 				opts.SelectorArg = args[0]
+			}
+
+			if opts.SelectorArg != "" {
+				// If a URL is provided, we need to parse it to override the
+				// base repository, especially the hostname part. That's because
+				// we need a feature detector down in this command, and that
+				// needs to know the API host. If the command is run outside of
+				// a git repo, we cannot instantiate the detector unless we have
+				// already parsed the URL.
+				if baseRepo, _, err := shared.ParseURL(opts.SelectorArg); err == nil {
+					opts.BaseRepo = func() (ghrepo.Interface, error) {
+						return baseRepo, nil
+					}
+				}
 			}
 
 			flags := cmd.Flags()
@@ -93,6 +127,14 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(*EditOptions) error) *cobra.Comman
 				}
 			}
 
+			if err := cmdutil.MutuallyExclusive(
+				"specify only one of `--milestone` or `--remove-milestone`",
+				flags.Changed("milestone"),
+				removeMilestone,
+			); err != nil {
+				return err
+			}
+
 			if flags.Changed("title") {
 				opts.Editable.Title.Edited = true
 			}
@@ -114,8 +156,13 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(*EditOptions) error) *cobra.Comman
 			if flags.Changed("add-project") || flags.Changed("remove-project") {
 				opts.Editable.Projects.Edited = true
 			}
-			if flags.Changed("milestone") {
+			if flags.Changed("milestone") || removeMilestone {
 				opts.Editable.Milestone.Edited = true
+
+				// Note that when `--remove-milestone` is provided, the value of
+				// `opts.Editable.Milestone.Value` will automatically be empty,
+				// which results in milestone association removal. For reference,
+				// see the `Editable.MilestoneId` method.
 			}
 
 			if !opts.Editable.Dirty() {
@@ -140,13 +187,14 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(*EditOptions) error) *cobra.Comman
 	cmd.Flags().StringVarP(&opts.Editable.Base.Value, "base", "B", "", "Change the base `branch` for this pull request")
 	cmd.Flags().StringSliceVar(&opts.Editable.Reviewers.Add, "add-reviewer", nil, "Add reviewers by their `login`.")
 	cmd.Flags().StringSliceVar(&opts.Editable.Reviewers.Remove, "remove-reviewer", nil, "Remove reviewers by their `login`.")
-	cmd.Flags().StringSliceVar(&opts.Editable.Assignees.Add, "add-assignee", nil, "Add assigned users by their `login`. Use \"@me\" to assign yourself.")
-	cmd.Flags().StringSliceVar(&opts.Editable.Assignees.Remove, "remove-assignee", nil, "Remove assigned users by their `login`. Use \"@me\" to unassign yourself.")
+	cmd.Flags().StringSliceVar(&opts.Editable.Assignees.Add, "add-assignee", nil, "Add assigned users by their `login`. Use \"@me\" to assign yourself, or \"@copilot\" to assign Copilot.")
+	cmd.Flags().StringSliceVar(&opts.Editable.Assignees.Remove, "remove-assignee", nil, "Remove assigned users by their `login`. Use \"@me\" to unassign yourself, or \"@copilot\" to unassign Copilot.")
 	cmd.Flags().StringSliceVar(&opts.Editable.Labels.Add, "add-label", nil, "Add labels by `name`")
 	cmd.Flags().StringSliceVar(&opts.Editable.Labels.Remove, "remove-label", nil, "Remove labels by `name`")
-	cmd.Flags().StringSliceVar(&opts.Editable.Projects.Add, "add-project", nil, "Add the pull request to projects by `name`")
-	cmd.Flags().StringSliceVar(&opts.Editable.Projects.Remove, "remove-project", nil, "Remove the pull request from projects by `name`")
+	cmd.Flags().StringSliceVar(&opts.Editable.Projects.Add, "add-project", nil, "Add the pull request to projects by `title`")
+	cmd.Flags().StringSliceVar(&opts.Editable.Projects.Remove, "remove-project", nil, "Remove the pull request from projects by `title`")
 	cmd.Flags().StringVarP(&opts.Editable.Milestone.Value, "milestone", "m", "", "Edit the milestone the pull request belongs to by `name`")
+	cmd.Flags().BoolVar(&removeMilestone, "remove-milestone", false, "Remove the milestone association from the pull request")
 
 	_ = cmdutil.RegisterBranchCompletionFlags(f.GitClient, cmd, "base")
 
@@ -172,10 +220,38 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(*EditOptions) error) *cobra.Comman
 }
 
 func editRun(opts *EditOptions) error {
+	httpClient, err := opts.HttpClient()
+	if err != nil {
+		return err
+	}
+
+	if opts.Detector == nil {
+		baseRepo, err := opts.BaseRepo()
+		if err != nil {
+			return err
+		}
+
+		cachedClient := api.NewCachedHTTPClient(httpClient, time.Hour*24)
+		opts.Detector = fd.NewDetector(cachedClient, baseRepo.RepoHost())
+	}
+
 	findOptions := shared.FindOptions{
 		Selector: opts.SelectorArg,
-		Fields:   []string{"id", "url", "title", "body", "baseRefName", "reviewRequests", "assignees", "labels", "projectCards", "projectItems", "milestone"},
+		Fields:   []string{"id", "url", "title", "body", "baseRefName", "reviewRequests", "labels", "projectCards", "projectItems", "milestone"},
+		Detector: opts.Detector,
 	}
+
+	issueFeatures, err := opts.Detector.IssueFeatures()
+	if err != nil {
+		return err
+	}
+
+	if issueFeatures.ActorIsAssignable {
+		findOptions.Fields = append(findOptions.Fields, "assignedActors")
+	} else {
+		findOptions.Fields = append(findOptions.Fields, "assignees")
+	}
+
 	pr, repo, err := opts.Finder.Find(findOptions)
 	if err != nil {
 		return err
@@ -187,7 +263,13 @@ func editRun(opts *EditOptions) error {
 	editable.Body.Default = pr.Body
 	editable.Base.Default = pr.BaseRefName
 	editable.Reviewers.Default = pr.ReviewRequests.Logins()
-	editable.Assignees.Default = pr.Assignees.Logins()
+	if issueFeatures.ActorIsAssignable {
+		editable.Assignees.ActorAssignees = true
+		editable.Assignees.Default = pr.AssignedActors.DisplayNames()
+		editable.Assignees.DefaultLogins = pr.AssignedActors.Logins()
+	} else {
+		editable.Assignees.Default = pr.Assignees.Logins()
+	}
 	editable.Labels.Default = pr.Labels.Names()
 	editable.Projects.Default = append(pr.ProjectCards.ProjectNames(), pr.ProjectItems.ProjectTitles()...)
 	projectItems := map[string]string{}
@@ -206,10 +288,6 @@ func editRun(opts *EditOptions) error {
 		}
 	}
 
-	httpClient, err := opts.HttpClient()
-	if err != nil {
-		return err
-	}
 	apiClient := api.NewClientFromHTTP(httpClient)
 
 	opts.IO.StartProgressIndicator()
@@ -260,6 +338,9 @@ func updatePullRequestReviews(httpClient *http.Client, repo ghrepo.Interface, id
 	if err != nil {
 		return err
 	}
+	if userIds == nil && teamIds == nil {
+		return nil
+	}
 	union := githubv4.Boolean(false)
 	reviewsRequestParams := githubv4.RequestReviewsInput{
 		PullRequestID: id,
@@ -276,14 +357,16 @@ type Surveyor interface {
 	EditFields(*shared.Editable, string) error
 }
 
-type surveyor struct{}
+type surveyor struct {
+	P shared.EditPrompter
+}
 
 func (s surveyor) FieldsToEdit(editable *shared.Editable) error {
-	return shared.FieldsToEditSurvey(editable)
+	return shared.FieldsToEditSurvey(s.P, editable)
 }
 
 func (s surveyor) EditFields(editable *shared.Editable, editorCmd string) error {
-	return shared.EditFieldsSurvey(editable, editorCmd)
+	return shared.EditFieldsSurvey(s.P, editable, editorCmd)
 }
 
 type EditableOptionsFetcher interface {
@@ -301,7 +384,7 @@ type EditorRetriever interface {
 }
 
 type editorRetriever struct {
-	config func() (config.Config, error)
+	config func() (gh.Config, error)
 }
 
 func (e editorRetriever) Retrieve() (string, error) {

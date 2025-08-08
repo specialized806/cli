@@ -95,14 +95,16 @@ func displayIssueResults(io *iostreams.IOStreams, now time.Time, et EntityType, 
 	if now.IsZero() {
 		now = time.Now()
 	}
-	isTTY := io.IsStdoutTTY()
-	cs := io.ColorScheme()
-	tp := tableprinter.New(io)
+
+	var headers []string
 	if et == Both {
-		tp.HeaderRow("Kind", "Repo", "ID", "Title", "Labels", "Updated")
+		headers = []string{"Kind", "Repo", "ID", "Title", "Labels", "Updated"}
 	} else {
-		tp.HeaderRow("Repo", "ID", "Title", "Labels", "Updated")
+		headers = []string{"Repo", "ID", "Title", "Labels", "Updated"}
 	}
+
+	cs := io.ColorScheme()
+	tp := tableprinter.New(io, tableprinter.WithHeader(headers...))
 	for _, issue := range results.Items {
 		if et == Both {
 			kind := "issue"
@@ -115,7 +117,7 @@ func displayIssueResults(io *iostreams.IOStreams, now time.Time, et EntityType, 
 		name := comp[len(comp)-2:]
 		tp.AddField(strings.Join(name, "/"))
 		issueNum := strconv.Itoa(issue.Number)
-		if isTTY {
+		if tp.IsTTY() {
 			issueNum = "#" + issueNum
 		}
 		if issue.IsPullRequest() {
@@ -125,16 +127,16 @@ func displayIssueResults(io *iostreams.IOStreams, now time.Time, et EntityType, 
 			color := tableprinter.WithColor(cs.ColorFromString(colorForIssueState(issue.State(), issue.StateReason)))
 			tp.AddField(issueNum, color)
 		}
-		if !isTTY {
+		if !tp.IsTTY() {
 			tp.AddField(issue.State())
 		}
 		tp.AddField(text.RemoveExcessiveWhitespace(issue.Title))
-		tp.AddField(listIssueLabels(&issue, cs, isTTY))
-		tp.AddTimeField(now, issue.UpdatedAt, cs.Gray)
+		tp.AddField(listIssueLabels(&issue, cs, tp.IsTTY()))
+		tp.AddTimeField(now, issue.UpdatedAt, cs.Muted)
 		tp.EndRow()
 	}
 
-	if isTTY {
+	if tp.IsTTY() {
 		var header string
 		switch et {
 		case Both:
@@ -156,7 +158,7 @@ func listIssueLabels(issue *search.Issue, cs *iostreams.ColorScheme, colorize bo
 	labelNames := make([]string, 0, len(issue.Labels))
 	for _, label := range issue.Labels {
 		if colorize {
-			labelNames = append(labelNames, cs.HexToRGB(label.Color, label.Name))
+			labelNames = append(labelNames, cs.Label(label.Color, label.Name))
 		} else {
 			labelNames = append(labelNames, label.Name)
 		}
