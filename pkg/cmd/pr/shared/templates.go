@@ -16,8 +16,9 @@ import (
 )
 
 type issueTemplate struct {
-	Gname string `graphql:"name"`
-	Gbody string `graphql:"body"`
+	Gname  string `graphql:"name"`
+	Gbody  string `graphql:"body"`
+	Gtitle string `graphql:"title"`
 }
 
 type pullRequestTemplate struct {
@@ -37,6 +38,10 @@ func (t *issueTemplate) Body() []byte {
 	return []byte(t.Gbody)
 }
 
+func (t *issueTemplate) Title() string {
+	return t.Gtitle
+}
+
 func (t *pullRequestTemplate) Name() string {
 	return t.Gname
 }
@@ -49,6 +54,10 @@ func (t *pullRequestTemplate) Body() []byte {
 	return []byte(t.Gbody)
 }
 
+func (t *pullRequestTemplate) Title() string {
+	return ""
+}
+
 func listIssueTemplates(httpClient *http.Client, repo ghrepo.Interface) ([]Template, error) {
 	var query struct {
 		Repository struct {
@@ -56,7 +65,7 @@ func listIssueTemplates(httpClient *http.Client, repo ghrepo.Interface) ([]Templ
 		} `graphql:"repository(owner: $owner, name: $name)"`
 	}
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner": githubv4.String(repo.RepoOwner()),
 		"name":  githubv4.String(repo.RepoName()),
 	}
@@ -84,7 +93,7 @@ func listPullRequestTemplates(httpClient *http.Client, repo ghrepo.Interface) ([
 		} `graphql:"repository(owner: $owner, name: $name)"`
 	}
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner": githubv4.String(repo.RepoOwner()),
 		"name":  githubv4.String(repo.RepoName()),
 	}
@@ -109,6 +118,7 @@ type Template interface {
 	Name() string
 	NameForSubmit() string
 	Body() []byte
+	Title() string
 }
 
 type iprompter interface {
@@ -255,7 +265,8 @@ func (m *templateManager) fetch() error {
 		gitClient := &git.Client{}
 		dir, err = gitClient.ToplevelDir(context.Background())
 		if err != nil {
-			return nil // abort silently
+			//nolint:nilerr // intentional, abort silently
+			return nil
 		}
 	}
 
@@ -293,4 +304,8 @@ func (t *filesystemTemplate) NameForSubmit() string {
 
 func (t *filesystemTemplate) Body() []byte {
 	return githubtemplate.ExtractContents(t.path)
+}
+
+func (t *filesystemTemplate) Title() string {
+	return githubtemplate.ExtractTitle(t.path)
 }

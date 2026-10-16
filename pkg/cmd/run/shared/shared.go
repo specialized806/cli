@@ -1,22 +1,25 @@
 package shared
 
 import (
-	"archive/zip"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/internal/ghrepo"
-	"github.com/cli/cli/v2/internal/prompter"
+	"github.com/cli/cli/v2/internal/safeurl"
 	workflowShared "github.com/cli/cli/v2/pkg/cmd/workflow/shared"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
 )
+
+type Prompter interface {
+	Select(string, string, []string) (int, error)
+}
 
 const (
 	// Run statuses
@@ -25,6 +28,7 @@ const (
 	InProgress Status = "in_progress"
 	Requested  Status = "requested"
 	Waiting    Status = "waiting"
+	Pending    Status = "pending"
 
 	// Run conclusions
 	ActionRequired Conclusion = "action_required"
@@ -51,6 +55,7 @@ var AllStatuses = []string{
 	"in_progress",
 	"requested",
 	"waiting",
+	"pending",
 	"action_required",
 	"cancelled",
 	"failure",
@@ -70,6 +75,7 @@ var RunFields = []string{
 	"createdAt",
 	"updatedAt",
 	"startedAt",
+	"attempt",
 	"status",
 	"conclusion",
 	"event",
@@ -95,14 +101,14 @@ type Run struct {
 	workflowName   string // cache column
 	WorkflowID     int64  `json:"workflow_id"`
 	Number         int64  `json:"run_number"`
-	Attempts       uint64 `json:"run_attempt"`
+	Attempt        uint64 `json:"run_attempt"`
 	HeadBranch     string `json:"head_branch"`
 	JobsURL        string `json:"jobs_url"`
 	HeadCommit     Commit `json:"head_commit"`
 	HeadSha        string `json:"head_sha"`
 	URL            string `json:"html_url"`
 	HeadRepository Repo   `json:"head_repository"`
-	Jobs           []Job  `json:"-"` // populated by GetJobs
+	Jobs           []Job  `json:"-"` // Populated manually (separate from fetching the run)
 }
 
 func (r *Run) StartedTime() time.Time {
@@ -155,14 +161,14 @@ func (r Run) WorkflowName() string {
 	return r.workflowName
 }
 
-func (r *Run) ExportData(fields []string) map[string]interface{} {
+func (r *Run) ExportData(fields []string) map[string]any {
 	v := reflect.ValueOf(r).Elem()
 	fieldByName := func(v reflect.Value, field string) reflect.Value {
 		return v.FieldByNameFunc(func(s string) bool {
 			return strings.EqualFold(field, s)
 		})
 	}
-	data := map[string]interface{}{}
+	data := map[string]any{}
 
 	for _, f := range fields {
 		switch f {
@@ -173,33 +179,39 @@ func (r *Run) ExportData(fields []string) map[string]interface{} {
 		case "workflowName":
 			data[f] = r.WorkflowName()
 		case "jobs":
-			jobs := make([]interface{}, 0, len(r.Jobs))
+			jobs := make([]any, 0, len(r.Jobs))
 			for _, j := range r.Jobs {
-				steps := make([]interface{}, 0, len(j.Steps))
+				steps := make([]any, 0, len(j.Steps))
 				for _, s := range j.Steps {
-					steps = append(steps, map[string]interface{}{
-						"name":       s.Name,
-						"status":     s.Status,
-						"conclusion": s.Conclusion,
-						"number":     s.Number,
+					var stepCompletedAt time.Time
+					if !s.CompletedAt.IsZero() {
+						stepCompletedAt = s.CompletedAt
+					}
+					steps = append(steps, map[string]any{
+						"name":        s.Name,
+						"status":      s.Status,
+						"conclusion":  s.Conclusion,
+						"number":      s.Number,
+						"startedAt":   s.StartedAt,
+						"completedAt": stepCompletedAt,
 					})
 				}
-				var completedAt *time.Time
+				var jobCompletedAt time.Time
 				if !j.CompletedAt.IsZero() {
-					completedAt = &j.CompletedAt
+					jobCompletedAt = j.CompletedAt
 				}
-				jobs = append(jobs, map[string]interface{}{
+				jobs = append(jobs, map[string]any{
 					"databaseId":  j.ID,
 					"status":      j.Status,
 					"conclusion":  j.Conclusion,
 					"name":        j.Name,
 					"steps":       steps,
 					"startedAt":   j.StartedAt,
-					"completedAt": completedAt,
+					"completedAt": jobCompletedAt,
 					"url":         j.URL,
 				})
-				data[f] = jobs
 			}
+			data[f] = jobs
 		default:
 			sf := fieldByName(v, f)
 			data[f] = sf.Interface()
@@ -222,11 +234,12 @@ type Job struct {
 }
 
 type Step struct {
-	Name       string
-	Status     Status
-	Conclusion Conclusion
-	Number     int
-	Log        *zip.File
+	Name        string
+	Status      Status
+	Conclusion  Conclusion
+	Number      int
+	StartedAt   time.Time `json:"started_at"`
+	CompletedAt time.Time `json:"completed_at"`
 }
 
 type Steps []Step
@@ -258,17 +271,37 @@ type CheckRun struct {
 	ID int64
 }
 
+var ErrMissingAnnotationsPermissions = errors.New("missing annotations permissions error")
+
+// GetAnnotations fetches annotations from the REST API.
+//
+// If the job has no annotations, an empty slice is returned.
+// If the API returns a 403, a custom ErrMissingAnnotationsPermissions error is returned.
+//
+// When fine-grained PATs support checks:read permission, we can remove the need for this at the call sites.
 func GetAnnotations(client *api.Client, repo ghrepo.Interface, job Job) ([]Annotation, error) {
 	var result []*Annotation
 
-	path := fmt.Sprintf("repos/%s/check-runs/%d/annotations", ghrepo.FullName(repo), job.ID)
+	path, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "check-runs", strconv.FormatInt(job.ID, 10), "annotations")
+	if err != nil {
+		return nil, err
+	}
 
-	err := client.REST(repo.RepoHost(), "GET", path, nil, &result)
+	err = client.REST(repo.RepoHost(), "GET", path.String(), nil, &result)
 	if err != nil {
 		var httpError api.HTTPError
-		if errors.As(err, &httpError) && httpError.StatusCode == 404 {
+		if !errors.As(err, &httpError) {
+			return nil, err
+		}
+
+		if httpError.StatusCode == http.StatusNotFound {
 			return []Annotation{}, nil
 		}
+
+		if httpError.StatusCode == http.StatusForbidden {
+			return nil, ErrMissingAnnotationsPermissions
+		}
+
 		return nil, err
 	}
 
@@ -291,6 +324,10 @@ func IsFailureState(c Conclusion) bool {
 	}
 }
 
+func IsSkipped(c Conclusion) bool {
+	return c == Skipped
+}
+
 type RunsPayload struct {
 	TotalCount   int   `json:"total_count"`
 	WorkflowRuns []Run `json:"workflow_runs"`
@@ -303,6 +340,9 @@ type FilterOptions struct {
 	// avoid loading workflow name separately and use the provided one
 	WorkflowName string
 	Status       string
+	Event        string
+	Created      string
+	Commit       string
 }
 
 // GetRunsWithFilter fetches 50 runs from the API and filters them in-memory
@@ -326,40 +366,53 @@ func GetRunsWithFilter(client *api.Client, repo ghrepo.Interface, opts *FilterOp
 }
 
 func GetRuns(client *api.Client, repo ghrepo.Interface, opts *FilterOptions, limit int) (*RunsPayload, error) {
-	path := fmt.Sprintf("repos/%s/actions/runs", ghrepo.FullName(repo))
+	u, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "runs")
+	if err != nil {
+		return nil, err
+	}
 	if opts != nil && opts.WorkflowID > 0 {
-		path = fmt.Sprintf("repos/%s/actions/workflows/%d/runs", ghrepo.FullName(repo), opts.WorkflowID)
+		u, err = safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "workflows", strconv.FormatInt(opts.WorkflowID, 10), "runs")
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	perPage := limit
-	if limit > 100 {
-		perPage = 100
-	}
-	path += fmt.Sprintf("?per_page=%d", perPage)
-	path += "&exclude_pull_requests=true" // significantly reduces payload size
+	perPage := min(limit, 100)
+	u.SetQuery("per_page", strconv.Itoa(perPage))
+	u.SetQuery("exclude_pull_requests", "true") // significantly reduces payload size
 
 	if opts != nil {
 		if opts.Branch != "" {
-			path += fmt.Sprintf("&branch=%s", url.QueryEscape(opts.Branch))
+			u.SetQuery("branch", opts.Branch)
 		}
 		if opts.Actor != "" {
-			path += fmt.Sprintf("&actor=%s", url.QueryEscape(opts.Actor))
+			u.SetQuery("actor", opts.Actor)
 		}
 		if opts.Status != "" {
-			path += fmt.Sprintf("&status=%s", url.QueryEscape(opts.Status))
+			u.SetQuery("status", opts.Status)
+		}
+		if opts.Event != "" {
+			u.SetQuery("event", opts.Event)
+		}
+		if opts.Created != "" {
+			u.SetQuery("created", opts.Created)
+		}
+		if opts.Commit != "" {
+			u.SetQuery("head_sha", opts.Commit)
 		}
 	}
+	var pageURL safeurl.SafeURL = u
 
 	var result *RunsPayload
 
 pagination:
-	for path != "" {
+	for pageURL.String() != "" {
 		var response RunsPayload
-		var err error
-		path, err = client.RESTWithNext(repo.RepoHost(), "GET", path, nil, &response)
+		next, err := client.RESTWithNext(repo.RepoHost(), "GET", pageURL.String(), nil, &response)
 		if err != nil {
 			return nil, err
 		}
+		pageURL = safeurl.NewImmutableSafeURL(next)
 
 		if result == nil {
 			result = &response
@@ -404,6 +457,18 @@ func preloadWorkflowNames(client *api.Client, repo ghrepo.Interface, runs []Run)
 		if _, ok := workflowMap[run.WorkflowID]; !ok {
 			// Look up workflow by ID because it may have been deleted
 			workflow, err := workflowShared.GetWorkflow(client, repo, run.WorkflowID)
+			// If the error is an httpError and it is a 404, this is likely a
+			// organization or enterprise ruleset workflow. The user does not
+			// have permissions to view the details of the workflow, so we cannot
+			// look it up directly without receiving a 404, but it is nonetheless
+			// in the workflow run list. To handle this, we set the workflow name
+			// to an empty string.
+			// Deciding to put this here instead of in GetWorkflow to allow
+			// the caller to decide what a 404 means.
+			if httpErr, ok := err.(api.HTTPError); ok && httpErr.StatusCode == 404 {
+				workflowMap[run.WorkflowID] = ""
+				continue
+			}
 			if err != nil {
 				return err
 			}
@@ -415,26 +480,53 @@ func preloadWorkflowNames(client *api.Client, repo ghrepo.Interface, runs []Run)
 }
 
 type JobsPayload struct {
-	Jobs []Job
+	TotalCount int `json:"total_count"`
+	Jobs       []Job
 }
 
-func GetJobs(client *api.Client, repo ghrepo.Interface, run *Run) ([]Job, error) {
-	if run.Jobs != nil {
-		return run.Jobs, nil
+func GetJobs(client *api.Client, repo ghrepo.Interface, runID int64, jobsURL safeurl.SafeURL, attempt uint64) ([]Job, error) {
+	var jobsPath safeurl.SafeURL
+	if attempt > 0 {
+		p, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "runs", strconv.FormatInt(runID, 10), "attempts", strconv.FormatUint(attempt, 10), "jobs")
+		if err != nil {
+			return nil, err
+		}
+		p.SetQuery("per_page", "100")
+		jobsPath = p
+	} else {
+		u, err := url.Parse(jobsURL.String())
+		if err != nil {
+			return nil, err
+		}
+		query := url.Values{}
+		query.Set("per_page", "100")
+		u.RawQuery = query.Encode()
+		// Since u is derived from jobsURL, an already-trusted safeurl.SafeURL, the resulting URL is safe to declare as such.
+		jobsPath = safeurl.NewImmutableSafeURL(u.String())
 	}
-	var result JobsPayload
-	if err := client.REST(repo.RepoHost(), "GET", run.JobsURL, nil, &result); err != nil {
-		return nil, err
+
+	// A non-nil empty slice is returned so callers can tell that jobs were fetched and there are none (if len is zero).
+	jobs := []Job{}
+	for jobsPath.String() != "" {
+		var resp JobsPayload
+		next, err := client.RESTWithNext(repo.RepoHost(), http.MethodGet, jobsPath.String(), nil, &resp)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, resp.Jobs...)
+		jobsPath = safeurl.NewImmutableSafeURL(next)
 	}
-	run.Jobs = result.Jobs
-	return result.Jobs, nil
+	return jobs, nil
 }
 
 func GetJob(client *api.Client, repo ghrepo.Interface, jobID string) (*Job, error) {
-	path := fmt.Sprintf("repos/%s/actions/jobs/%s", ghrepo.FullName(repo), jobID)
+	path, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "jobs", jobID)
+	if err != nil {
+		return nil, err
+	}
 
 	var result Job
-	err := client.REST(repo.RepoHost(), "GET", path, nil, &result)
+	err = client.REST(repo.RepoHost(), "GET", path.String(), nil, &result)
 	if err != nil {
 		return nil, err
 	}
@@ -443,7 +535,7 @@ func GetJob(client *api.Client, repo ghrepo.Interface, jobID string) (*Job, erro
 }
 
 // SelectRun prompts the user to select a run from a list of runs by using the recommended prompter interface
-func SelectRun(p prompter.Prompter, cs *iostreams.ColorScheme, runs []Run) (string, error) {
+func SelectRun(p Prompter, cs *iostreams.ColorScheme, runs []Run) (string, error) {
 	now := time.Now()
 
 	candidates := []string{}
@@ -452,7 +544,7 @@ func SelectRun(p prompter.Prompter, cs *iostreams.ColorScheme, runs []Run) (stri
 		symbol, _ := Symbol(cs, run.Status, run.Conclusion)
 		candidates = append(candidates,
 			// TODO truncate commit message, long ones look terrible
-			fmt.Sprintf("%s %s, %s (%s) %s", symbol, run.Title(), run.WorkflowName(), run.HeadBranch, preciseAgo(now, run.StartedTime())))
+			fmt.Sprintf("%s %s, %s [%s] %s", symbol, run.Title(), run.WorkflowName(), run.HeadBranch, preciseAgo(now, run.StartedTime())))
 	}
 
 	selected, err := p.Select("Select a workflow run", "", candidates)
@@ -464,46 +556,23 @@ func SelectRun(p prompter.Prompter, cs *iostreams.ColorScheme, runs []Run) (stri
 	return fmt.Sprintf("%d", runs[selected].ID), nil
 }
 
-// TODO: this should be deprecated in favor of SelectRun
-func PromptForRun(cs *iostreams.ColorScheme, runs []Run) (string, error) {
-	var selected int
-	now := time.Now()
-
-	candidates := []string{}
-
-	for _, run := range runs {
-		symbol, _ := Symbol(cs, run.Status, run.Conclusion)
-		candidates = append(candidates,
-			// TODO truncate commit message, long ones look terrible
-			fmt.Sprintf("%s %s, %s (%s) %s", symbol, run.Title(), run.WorkflowName(), run.HeadBranch, preciseAgo(now, run.StartedTime())))
-	}
-
-	// TODO consider custom filter so it's fuzzier. right now matches start anywhere in string but
-	// become contiguous
-	//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-	err := prompt.SurveyAskOne(&survey.Select{
-		Message:  "Select a workflow run",
-		Options:  candidates,
-		PageSize: 10,
-	}, &selected)
-
-	if err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("%d", runs[selected].ID), nil
-}
-
 func GetRun(client *api.Client, repo ghrepo.Interface, runID string, attempt uint64) (*Run, error) {
 	var result Run
 
-	path := fmt.Sprintf("repos/%s/actions/runs/%s?exclude_pull_requests=true", ghrepo.FullName(repo), runID)
-
-	if attempt > 0 {
-		path = fmt.Sprintf("repos/%s/actions/runs/%s/attempts/%d?exclude_pull_requests=true", ghrepo.FullName(repo), runID, attempt)
+	u, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "runs", runID)
+	if err != nil {
+		return nil, err
 	}
 
-	err := client.REST(repo.RepoHost(), "GET", path, nil, &result)
+	if attempt > 0 {
+		u, err = safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "runs", runID, "attempts", strconv.FormatUint(attempt, 10))
+		if err != nil {
+			return nil, err
+		}
+	}
+	u.SetQuery("exclude_pull_requests", "true")
+
+	err = client.REST(repo.RepoHost(), "GET", u.String(), nil, &result)
 	if err != nil {
 		return nil, err
 	}
@@ -535,7 +604,7 @@ func Symbol(cs *iostreams.ColorScheme, status Status, conclusion Conclusion) (st
 		case Success:
 			return cs.SuccessIconWithColor(noColor), cs.Green
 		case Skipped, Neutral:
-			return "-", cs.Gray
+			return "-", cs.Muted
 		default:
 			return cs.FailureIconWithColor(noColor), cs.Red
 		}
@@ -562,7 +631,7 @@ func PullRequestForRun(client *api.Client, repo ghrepo.Interface, run Run) (int,
 		Number int
 	}
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner":       repo.RepoOwner(),
 		"repo":        repo.RepoName(),
 		"headRefName": run.HeadBranch,

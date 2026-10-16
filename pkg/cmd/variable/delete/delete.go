@@ -6,8 +6,9 @@ import (
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/safeurl"
 	"github.com/cli/cli/v2/pkg/cmd/variable/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -17,7 +18,7 @@ import (
 type DeleteOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
-	Config     func() (config.Config, error)
+	Config     func() (gh.Config, error)
 	BaseRepo   func() (ghrepo.Interface, error)
 
 	VariableName string
@@ -37,9 +38,9 @@ func NewCmdDelete(f *cmdutil.Factory, runF func(*DeleteOptions) error) *cobra.Co
 		Short: "Delete variables",
 		Long: heredoc.Doc(`
 			Delete a variable on one of the following levels:
-			- repository (default): available to Actions runs or Dependabot in a repository
-			- environment: available to Actions runs for a deployment environment in a repository
-			- organization: available to Actions runs or Dependabot within an organization
+			- repository (default): available to GitHub Actions runs or Dependabot in a repository
+			- environment: available to GitHub Actions runs for a deployment environment in a repository
+			- organization: available to GitHub Actions runs or Dependabot within an organization
 		`),
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -91,24 +92,29 @@ func removeRun(opts *DeleteOptions) error {
 		}
 	}
 
-	var path string
-	switch variableEntity {
-	case shared.Organization:
-		path = fmt.Sprintf("orgs/%s/actions/variables/%s", orgName, opts.VariableName)
-	case shared.Environment:
-		path = fmt.Sprintf("repos/%s/environments/%s/variables/%s", ghrepo.FullName(baseRepo), envName, opts.VariableName)
-	case shared.Repository:
-		path = fmt.Sprintf("repos/%s/actions/variables/%s", ghrepo.FullName(baseRepo), opts.VariableName)
-	}
-
 	cfg, err := opts.Config()
 	if err != nil {
 		return err
 	}
 
-	host, _ := cfg.Authentication().DefaultHost()
+	var path *safeurl.MutableSafeURL
+	var host string
+	switch variableEntity {
+	case shared.Organization:
+		path, err = safeurl.JoinPath("orgs", orgName, "actions", "variables", opts.VariableName)
+		host, _ = cfg.Authentication().DefaultHost()
+	case shared.Environment:
+		path, err = safeurl.JoinPath("repos", baseRepo.RepoOwner(), baseRepo.RepoName(), "environments", envName, "variables", opts.VariableName)
+		host = baseRepo.RepoHost()
+	case shared.Repository:
+		path, err = safeurl.JoinPath("repos", baseRepo.RepoOwner(), baseRepo.RepoName(), "actions", "variables", opts.VariableName)
+		host = baseRepo.RepoHost()
+	}
+	if err != nil {
+		return err
+	}
 
-	err = client.REST(host, "DELETE", path, nil, nil)
+	err = client.REST(host, "DELETE", path.String(), nil, nil)
 	if err != nil {
 		return fmt.Errorf("failed to delete variable %s: %w", opts.VariableName, err)
 	}
@@ -126,7 +132,7 @@ func removeRun(opts *DeleteOptions) error {
 		if envName != "" {
 			fmt.Fprintf(opts.IO.Out, "%s Deleted variable %s from %s environment on %s\n", cs.SuccessIconWithColor(cs.Red), opts.VariableName, envName, target)
 		} else {
-			fmt.Fprintf(opts.IO.Out, "%s Deleted Actions variable %s from %s\n", cs.SuccessIconWithColor(cs.Red), opts.VariableName, target)
+			fmt.Fprintf(opts.IO.Out, "%s Deleted variable %s from %s\n", cs.SuccessIconWithColor(cs.Red), opts.VariableName, target)
 		}
 	}
 

@@ -3,15 +3,69 @@ package list
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/MakeNowJust/heredoc"
+	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/pkg/httpmock"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func Test_userKeysScopesMissing(t *testing.T) {
+	reg := &httpmock.Registry{}
+	defer reg.Verify(t)
+	reg.Register(
+		httpmock.QueryMatcher("GET", "user/gpg_keys", url.Values{"per_page": []string{"100"}}),
+		httpmock.StatusStringResponse(http.StatusNotFound, `{"message":"Not Found"}`),
+	)
+
+	keys, err := userKeys(&http.Client{Transport: reg}, "github.com", "")
+
+	assert.Nil(t, keys)
+	require.Same(t, errScopes, err)
+}
+
+func Test_userKeysHTTPError(t *testing.T) {
+	reg := &httpmock.Registry{}
+	defer reg.Verify(t)
+	reg.Register(
+		httpmock.QueryMatcher("GET", "user/gpg_keys", url.Values{"per_page": []string{"100"}}),
+		httpmock.WithHeader(
+			httpmock.StatusStringResponse(http.StatusInternalServerError, `{"message":"Internal Server Error"}`),
+			"Content-Type", "application/json",
+		),
+	)
+
+	keys, err := userKeys(&http.Client{Transport: reg}, "github.com", "")
+
+	assert.Nil(t, keys)
+	var httpErr api.HTTPError
+	require.ErrorAs(t, err, &httpErr)
+	assert.Equal(t, http.StatusInternalServerError, httpErr.StatusCode)
+	assert.Contains(t, err.Error(), "HTTP 500")
+	assert.EqualError(t, err, "HTTP 500: Internal Server Error (https://api.github.com/user/gpg_keys?per_page=100)")
+}
+
+func Test_userKeysForUser(t *testing.T) {
+	reg := &httpmock.Registry{}
+	defer reg.Verify(t)
+	reg.Register(
+		httpmock.QueryMatcher("GET", "users/monalisa/gpg_keys", url.Values{"per_page": []string{"100"}}),
+		httpmock.StringResponse(`[{"key_id":"ABC123"}]`),
+	)
+
+	keys, err := userKeys(&http.Client{Transport: reg}, "github.com", "monalisa")
+
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	assert.Equal(t, "ABC123", keys[0].KeyID)
+}
 
 func Test_listRun(t *testing.T) {
 	tests := []struct {
@@ -56,9 +110,9 @@ func Test_listRun(t *testing.T) {
 			}},
 			isTTY: true,
 			wantStdout: heredoc.Doc(`
-				EMAIL                KEY ID            PUBLIC KEY      ADDED  EXPIRES
-				johnny@test.com      ABCDEF1234567890  xJMEWfoofoofoo  1d     2099-01-01
-				monalisa@github.com  1234567890ABCDEF  xJMEWbarbarbar  1d     Never
+				EMAIL               KEY ID           PUBLIC KEY      ADDED            EXPIRES
+				johnny@test.com     ABCDEF123456...  xJMEWfoofoofoo  about 1 day ago  2099-01-01
+				monalisa@github...  1234567890AB...  xJMEWbarbarbar  about 1 day ago  Never
 			`),
 			wantStderr: "",
 		},
@@ -130,7 +184,7 @@ func Test_listRun(t *testing.T) {
 			ios.SetStderrTTY(tt.isTTY)
 			opts := tt.opts
 			opts.IO = ios
-			opts.Config = func() (config.Config, error) { return config.NewBlankConfig(), nil }
+			opts.Config = func() (gh.Config, error) { return config.NewMockConfig(), nil }
 			err := listRun(&opts)
 			if tt.wantErr {
 				assert.Error(t, err)

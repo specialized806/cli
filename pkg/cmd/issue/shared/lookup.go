@@ -8,95 +8,134 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cli/cli/v2/api"
-	fd "github.com/cli/cli/v2/internal/featuredetection"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	o "github.com/cli/cli/v2/pkg/option"
 	"github.com/cli/cli/v2/pkg/set"
+	"golang.org/x/sync/errgroup"
 )
 
-// IssueFromArgWithFields loads an issue or pull request with the specified fields. If some of the fields
-// could not be fetched by GraphQL, this returns a non-nil issue and a *PartialLoadError.
-func IssueFromArgWithFields(httpClient *http.Client, baseRepoFn func() (ghrepo.Interface, error), arg string, fields []string) (*api.Issue, ghrepo.Interface, error) {
-	issueNumber, baseRepo := issueMetadataFromURL(arg)
+var issueURLRE = regexp.MustCompile(`^/([^/]+)/([^/]+)/(?:issues|pull)/(\d+)`)
 
-	if issueNumber == 0 {
-		var err error
-		issueNumber, err = strconv.Atoi(strings.TrimPrefix(arg, "#"))
+func ParseIssuesFromArgs(args []string) ([]int, o.Option[ghrepo.Interface], error) {
+	var repo o.Option[ghrepo.Interface]
+	issueNumbers := make([]int, len(args))
+
+	for i, arg := range args {
+		// For each argument, parse the issue number and an optional repo
+		issueNumber, issueRepo, err := ParseIssueFromArg(arg)
 		if err != nil {
-			return nil, nil, fmt.Errorf("invalid issue format: %q", arg)
+			return nil, o.None[ghrepo.Interface](), err
 		}
+
+		// if this is our first issue repo found, then we need to set it
+		if repo.IsNone() {
+			repo = issueRepo
+		}
+
+		// if there is an issue repo returned, then we need to check if it is the same as the previous one
+		if issueRepo.IsSome() && repo.IsSome() {
+			// Unwraps are safe because we've checked for presence above
+			if !ghrepo.IsSame(repo.Unwrap(), issueRepo.Unwrap()) {
+				return nil, o.None[ghrepo.Interface](), fmt.Errorf(
+					"multiple issues must be in same repo: found %q, expected %q",
+					ghrepo.FullName(issueRepo.Unwrap()),
+					ghrepo.FullName(repo.Unwrap()),
+				)
+			}
+		}
+
+		// add the issue number to the list
+		issueNumbers[i] = issueNumber
 	}
 
-	if baseRepo == nil {
-		var err error
-		baseRepo, err = baseRepoFn()
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	issue, err := findIssueOrPR(httpClient, baseRepo, issueNumber, fields)
-	return issue, baseRepo, err
+	return issueNumbers, repo, nil
 }
 
-var issueURLRE = regexp.MustCompile(`^/([^/]+)/([^/]+)/issues/(\d+)`)
+func ParseIssueFromArg(arg string) (int, o.Option[ghrepo.Interface], error) {
+	issueLocator := tryParseIssueFromURL(arg)
+	if issueLocator, present := issueLocator.Value(); present {
+		return issueLocator.issueNumber, o.Some(issueLocator.repo), nil
+	}
 
-func issueMetadataFromURL(s string) (int, ghrepo.Interface) {
-	u, err := url.Parse(s)
+	issueNumber, err := strconv.Atoi(strings.TrimPrefix(arg, "#"))
 	if err != nil {
-		return 0, nil
+		return 0, o.None[ghrepo.Interface](), fmt.Errorf("invalid issue format: %q", arg)
+	}
+
+	return issueNumber, o.None[ghrepo.Interface](), nil
+}
+
+type issueLocator struct {
+	issueNumber int
+	repo        ghrepo.Interface
+}
+
+// tryParseIssueFromURL tries to parse an issue number and repo from a URL.
+func tryParseIssueFromURL(maybeURL string) o.Option[issueLocator] {
+	u, err := url.Parse(maybeURL)
+	if err != nil {
+		return o.None[issueLocator]()
 	}
 
 	if u.Scheme != "https" && u.Scheme != "http" {
-		return 0, nil
+		return o.None[issueLocator]()
 	}
 
 	m := issueURLRE.FindStringSubmatch(u.Path)
 	if m == nil {
-		return 0, nil
+		return o.None[issueLocator]()
 	}
 
 	repo := ghrepo.NewWithHost(m[1], m[2], u.Hostname())
 	issueNumber, _ := strconv.Atoi(m[3])
-	return issueNumber, repo
-}
-
-// Returns the issue number and repo if the issue URL is provided.
-// If only the issue number is provided, returns the number and nil repo.
-func IssueNumberAndRepoFromArg(arg string) (int, ghrepo.Interface, error) {
-	issueNumber, baseRepo := issueMetadataFromURL(arg)
-
-	if issueNumber == 0 {
-		var err error
-		issueNumber, err = strconv.Atoi(strings.TrimPrefix(arg, "#"))
-		if err != nil {
-			return 0, nil, fmt.Errorf("invalid issue format: %q", arg)
-		}
-	}
-
-	return issueNumber, baseRepo, nil
+	return o.Some(issueLocator{
+		issueNumber: issueNumber,
+		repo:        repo,
+	})
 }
 
 type PartialLoadError struct {
 	error
 }
 
-func findIssueOrPR(httpClient *http.Client, repo ghrepo.Interface, number int, fields []string) (*api.Issue, error) {
+// FindIssuesOrPRs loads 1 or more issues or pull requests with the specified fields. If some of the fields
+// could not be fetched by GraphQL, this returns non-nil issues and a *PartialLoadError.
+func FindIssuesOrPRs(httpClient *http.Client, repo ghrepo.Interface, issueNumbers []int, fields []string) ([]*api.Issue, error) {
+	issuesChan := make(chan *api.Issue, len(issueNumbers))
+	g := errgroup.Group{}
+	for _, num := range issueNumbers {
+		issueNumber := num
+		g.Go(func() error {
+			issue, err := FindIssueOrPR(httpClient, repo, issueNumber, fields)
+			if err != nil {
+				return err
+			}
+
+			issuesChan <- issue
+			return nil
+		})
+	}
+
+	err := g.Wait()
+	close(issuesChan)
+
+	if err != nil {
+		return nil, err
+	}
+
+	issues := make([]*api.Issue, 0, len(issueNumbers))
+	for issue := range issuesChan {
+		issues = append(issues, issue)
+	}
+
+	return issues, nil
+}
+
+func FindIssueOrPR(httpClient *http.Client, repo ghrepo.Interface, number int, fields []string) (*api.Issue, error) {
 	fieldSet := set.NewStringSet()
 	fieldSet.AddValues(fields)
-	if fieldSet.Contains("stateReason") {
-		cachedClient := api.NewCachedHTTPClient(httpClient, time.Hour*24)
-		detector := fd.NewDetector(cachedClient, repo.RepoHost())
-		features, err := detector.IssueFeatures()
-		if err != nil {
-			return nil, err
-		}
-		if !features.StateReason {
-			fieldSet.Remove("stateReason")
-		}
-	}
 
 	var getProjectItems bool
 	if fieldSet.Contains("projectItems") {
@@ -126,7 +165,7 @@ func findIssueOrPR(httpClient *http.Client, repo ghrepo.Interface, number int, f
 		}
 	}`, api.IssueGraphQL(fields), api.PullRequestGraphQL(fields))
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner":  repo.RepoOwner(),
 		"repo":   repo.RepoName(),
 		"number": number,
@@ -135,8 +174,7 @@ func findIssueOrPR(httpClient *http.Client, repo ghrepo.Interface, number int, f
 	var resp response
 	client := api.NewClientFromHTTP(httpClient)
 	if err := client.GraphQL(repo.RepoHost(), query, variables, &resp); err != nil {
-		var gerr api.GraphQLError
-		if errors.As(err, &gerr) {
+		if gerr, ok := errors.AsType[api.GraphQLError](err); ok {
 			if gerr.Match("NOT_FOUND", "repository.issue") && !resp.Repository.HasIssuesEnabled {
 				return nil, fmt.Errorf("the '%s' repository has disabled issues", ghrepo.FullName(repo))
 			} else if gerr.Match("FORBIDDEN", "repository.issue.projectCards.") {
@@ -168,4 +206,43 @@ func findIssueOrPR(httpClient *http.Client, repo ghrepo.Interface, number int, f
 	}
 
 	return resp.Repository.Issue, nil
+}
+
+// ResolveIssueRef parses an issue reference (number or URL) and returns its
+// node ID. References that point at a different host than baseRepo are
+// rejected because relationship mutations require IDs from the base host.
+func ResolveIssueRef(client *api.Client, baseRepo ghrepo.Interface, ref string) (string, error) {
+	number, repo, err := ParseIssueFromArg(ref)
+	if err != nil {
+		return "", err
+	}
+
+	targetRepo := baseRepo
+	if r, ok := repo.Value(); ok {
+		if r.RepoHost() != baseRepo.RepoHost() {
+			return "", fmt.Errorf("issue reference %q belongs to a different host (%s) than the current repository (%s)", ref, r.RepoHost(), baseRepo.RepoHost())
+		}
+		targetRepo = r
+	}
+
+	return api.IssueNodeID(client, targetRepo, number)
+}
+
+// ResolveIssueTypeName resolves an issue type name to its node ID by
+// fetching the repository's available types.
+func ResolveIssueTypeName(client *api.Client, repo ghrepo.Interface, typeName string) (string, error) {
+	issueTypes, err := api.RepoIssueTypes(client, repo)
+	if err != nil {
+		return "", err
+	}
+
+	typeNames := make([]string, len(issueTypes))
+	for i, t := range issueTypes {
+		typeNames[i] = t.Name
+		if strings.EqualFold(t.Name, typeName) {
+			return t.ID, nil
+		}
+	}
+
+	return "", fmt.Errorf("type %q not found; available types: %s", typeName, strings.Join(typeNames, ", "))
 }

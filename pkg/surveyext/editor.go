@@ -46,10 +46,10 @@ var EditorQuestionTemplate = `
 {{- color .Config.Icons.Question.Format }}{{ .Config.Icons.Question.Text }} {{color "reset"}}
 {{- color "default+hb"}}{{ .Message }} {{color "reset"}}
 {{- if .ShowAnswer}}
-  {{- color "cyan"}}{{.Answer}}{{color "reset"}}{{"\n"}}
+	{{- color "cyan"}}{{.Answer}}{{color "reset"}}{{"\n"}}
 {{- else }}
-  {{- if and .Help (not .ShowHelp)}}{{color "cyan"}}[{{ .Config.HelpInput }} for help]{{color "reset"}} {{end}}
-  {{- if and .Default (not .HideDefault)}}{{color "white"}}({{.Default}}) {{color "reset"}}{{end}}
+	{{- if and .Help (not .ShowHelp)}}{{color "cyan"}}[{{ .Config.HelpInput }} for help]{{color "reset"}} {{end}}
+	{{- if and .Default (not .HideDefault)}}{{color "white"}}({{.Default}}) {{color "reset"}}{{end}}
 	{{- color "cyan"}}[(e) to launch {{ .EditorCommand }}{{- if .BlankAllowed }}, enter to skip{{ end }}] {{color "reset"}}
 {{- end}}`
 
@@ -65,7 +65,7 @@ type EditorTemplateData struct {
 }
 
 // EXTENDED to augment prompt text and keypress handling
-func (e *GhEditor) prompt(initialValue string, config *survey.PromptConfig) (interface{}, error) {
+func (e *GhEditor) prompt(initialValue string, config *survey.PromptConfig) (any, error) {
 	err := e.Render(
 		EditorQuestionTemplate,
 		// EXTENDED to support printing editor in prompt and BlankAllowed
@@ -151,7 +151,7 @@ func (e *GhEditor) prompt(initialValue string, config *survey.PromptConfig) (int
 }
 
 // EXTENDED This is straight copypasta from survey to get our overridden prompt called.;
-func (e *GhEditor) Prompt(config *survey.PromptConfig) (interface{}, error) {
+func (e *GhEditor) Prompt(config *survey.PromptConfig) (any, error) {
 	initialValue := ""
 	if e.Default != "" && e.AppendDefault {
 		initialValue = e.Default

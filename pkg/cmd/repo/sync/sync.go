@@ -46,11 +46,11 @@ func NewCmdSync(f *cmdutil.Factory, runF func(*SyncOptions) error) *cobra.Comman
 		Use:   "sync [<destination-repository>]",
 		Short: "Sync a repository",
 		Long: heredoc.Docf(`
-			Sync destination repository from source repository. Syncing uses the main branch
+			Sync destination repository from source repository. Syncing uses the default branch
 			of the source repository to update the matching branch on the destination
 			repository so they are equal. A fast forward update will be used except when the
 			%[1]s--force%[1]s flag is specified, then the two branches will
-			by synced using a hard reset.
+			be synced using a hard reset.
 
 			Without an argument, the local repository is selected as the destination repository.
 
@@ -83,7 +83,7 @@ func NewCmdSync(f *cmdutil.Factory, runF func(*SyncOptions) error) *cobra.Comman
 	}
 
 	cmd.Flags().StringVarP(&opts.SrcArg, "source", "s", "", "Source repository")
-	cmd.Flags().StringVarP(&opts.Branch, "branch", "b", "", "Branch to sync (default: main branch)")
+	cmd.Flags().StringVarP(&opts.Branch, "branch", "b", "", "Branch to sync (default [default branch])")
 	cmd.Flags().BoolVarP(&opts.Force, "force", "", false, "Hard reset the branch of the destination repository to match the source repository")
 	return cmd
 }
@@ -151,15 +151,12 @@ func syncLocalRepo(opts *SyncOptions) error {
 		if errors.Is(err, divergingError) {
 			return fmt.Errorf("can't sync because there are diverging changes; use `--force` to overwrite the destination branch")
 		}
-		if errors.Is(err, mismatchRemotesError) {
-			return fmt.Errorf("can't sync because %s is not tracking %s", opts.Branch, ghrepo.FullName(srcRepo))
-		}
 		return err
 	}
 
 	if opts.IO.IsStdoutTTY() {
 		cs := opts.IO.ColorScheme()
-		fmt.Fprintf(opts.IO.Out, "%s Synced the \"%s\" branch from %s to local repository\n",
+		fmt.Fprintf(opts.IO.Out, "%s Synced the \"%s\" branch from \"%s\" to local repository\n",
 			cs.SuccessIcon(),
 			opts.Branch,
 			ghrepo.FullName(srcRepo))
@@ -206,8 +203,8 @@ func syncRemoteRepo(opts *SyncOptions) error {
 	if opts.IO.IsStdoutTTY() {
 		cs := opts.IO.ColorScheme()
 		branchName := opts.Branch
-		if idx := strings.Index(baseBranchLabel, ":"); idx >= 0 {
-			branchName = baseBranchLabel[idx+1:]
+		if _, after, ok := strings.Cut(baseBranchLabel, ":"); ok {
+			branchName = after
 		}
 		fmt.Fprintf(opts.IO.Out, "%s Synced the \"%s:%s\" branch from \"%s\"\n",
 			cs.SuccessIcon(),
@@ -220,7 +217,6 @@ func syncRemoteRepo(opts *SyncOptions) error {
 }
 
 var divergingError = errors.New("diverging changes")
-var mismatchRemotesError = errors.New("branch remote does not match specified source")
 
 func executeLocalRepoSync(srcRepo ghrepo.Interface, remote string, opts *SyncOptions) error {
 	git := opts.Git
@@ -229,19 +225,10 @@ func executeLocalRepoSync(srcRepo ghrepo.Interface, remote string, opts *SyncOpt
 
 	hasLocalBranch := git.HasLocalBranch(branch)
 	if hasLocalBranch {
-		branchRemote, err := git.BranchRemote(branch)
-		if err != nil {
-			return err
-		}
-		if branchRemote != remote {
-			return mismatchRemotesError
-		}
-
 		fastForward, err := git.IsAncestor(branch, "FETCH_HEAD")
 		if err != nil {
 			return err
 		}
-
 		if !fastForward && !useForce {
 			return divergingError
 		}
@@ -272,6 +259,16 @@ func executeLocalRepoSync(srcRepo ghrepo.Interface, remote string, opts *SyncOpt
 	} else {
 		if hasLocalBranch {
 			if err := git.UpdateBranch(branch, "FETCH_HEAD"); err != nil {
+				worktrees, worktreeErr := git.Worktrees()
+				if worktreeErr != nil {
+					return fmt.Errorf("cannot update branch %q: %w; also cannot retrieve worktrees: %w", branch, err, worktreeErr)
+				}
+				if worktree := gitpkg.WorktreeForBranch(worktrees, branch); worktree != nil {
+					if worktree.Prunable {
+						return fmt.Errorf("can't sync %q because stale worktree metadata still associates it with %s\ntip: run `git worktree prune` and retry", branch, worktree.Path)
+					}
+					return fmt.Errorf("can't sync %q because it's checked out in another worktree at %s\ntip: run `gh repo sync` from that worktree instead", branch, worktree.Path)
+				}
 				return err
 			}
 		} else {
@@ -284,6 +281,13 @@ func executeLocalRepoSync(srcRepo ghrepo.Interface, remote string, opts *SyncOpt
 	return nil
 }
 
+// ExecuteRemoteRepoSync will take several steps to sync the source and destination repositories.
+// First it will try to use the merge-upstream API endpoint. If this fails due to merge conflicts
+// or unknown merge issues then it will fallback to using the low level git references API endpoint.
+// The reason the fallback is necessary is to better support these error cases. The git references API
+// endpoint allows us to sync repositories that are not fast-forward merge compatible. Additionally,
+// the git references API endpoint gives more detailed error responses as to why the sync failed.
+// Unless the --force flag is specified we will not perform non-fast-forward merges.
 func executeRemoteRepoSync(client *api.Client, destRepo, srcRepo ghrepo.Interface, opts *SyncOptions) (string, error) {
 	branchName := opts.Branch
 	if branchName == "" {
@@ -294,10 +298,9 @@ func executeRemoteRepoSync(client *api.Client, destRepo, srcRepo ghrepo.Interfac
 		}
 	}
 
-	var apiErr upstreamMergeErr
 	if baseBranch, err := triggerUpstreamMerge(client, destRepo, branchName); err == nil {
 		return baseBranch, nil
-	} else if !errors.As(err, &apiErr) {
+	} else if _, ok := errors.AsType[upstreamMergeErr](err); !ok {
 		return "", err
 	}
 
@@ -317,12 +320,12 @@ func executeRemoteRepoSync(client *api.Client, destRepo, srcRepo ghrepo.Interfac
 		return "", err
 	}
 
-	// This is not a great way to detect the error returned by the API
-	// Unfortunately API returns 422 for multiple reasons
+	// Using string comparison is a brittle way to determine the error returned by the API
+	// endpoint but unfortunately the API returns 422 for many reasons so we must
+	// interpret the message provide better error messaging for our users.
 	err = syncFork(client, destRepo, branchName, commit.Object.SHA, opts.Force)
-	var httpErr api.HTTPError
 	if err != nil {
-		if errors.As(err, &httpErr) {
+		if httpErr, ok := errors.AsType[api.HTTPError](err); ok {
 			switch httpErr.Message {
 			case notFastForwardErrorMessage:
 				return "", divergingError

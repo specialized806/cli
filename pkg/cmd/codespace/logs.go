@@ -5,8 +5,8 @@ import (
 	"fmt"
 
 	"github.com/cli/cli/v2/internal/codespaces"
+	"github.com/cli/cli/v2/internal/codespaces/portforwarder"
 	"github.com/cli/cli/v2/internal/codespaces/rpc"
-	"github.com/cli/cli/v2/pkg/liveshare"
 	"github.com/spf13/cobra"
 )
 
@@ -42,14 +42,19 @@ func (a *App) Logs(ctx context.Context, selector *CodespaceSelector, follow bool
 		return err
 	}
 
-	session, err := startLiveShareSession(ctx, codespace, a, false, "")
+	codespaceConnection, err := codespaces.GetCodespaceConnection(ctx, a, a.apiClient, codespace)
 	if err != nil {
-		return err
+		return fmt.Errorf("error connecting to codespace: %w", err)
 	}
-	defer safeClose(session, &err)
+
+	fwd, err := portforwarder.NewPortForwarder(ctx, codespaceConnection)
+	if err != nil {
+		return fmt.Errorf("failed to create port forwarder: %w", err)
+	}
+	defer safeClose(fwd, &err)
 
 	// Ensure local port is listening before client (getPostCreateOutput) connects.
-	listen, localPort, err := codespaces.ListenTCP(0)
+	listen, localPort, err := codespaces.ListenTCP(0, false)
 	if err != nil {
 		return err
 	}
@@ -57,7 +62,7 @@ func (a *App) Logs(ctx context.Context, selector *CodespaceSelector, follow bool
 
 	remoteSSHServerPort, sshUser := 0, ""
 	err = a.RunWithProgress("Fetching SSH Details", func() (err error) {
-		invoker, err := rpc.CreateInvoker(ctx, session)
+		invoker, err := rpc.CreateInvoker(ctx, fwd)
 		if err != nil {
 			return
 		}
@@ -83,10 +88,23 @@ func (a *App) Logs(ctx context.Context, selector *CodespaceSelector, follow bool
 		return fmt.Errorf("remote command: %w", err)
 	}
 
+	// The log file is external content. On a terminal, route it through
+	// ContentOut to neutralize escape sequences (assigning a writer other than an
+	// *os.File also forces the remote output through this process so the sanitizer
+	// runs). When piped, pass the bytes through unchanged: there is no live
+	// terminal to manipulate, and a follow stream cannot be buffered to fail closed.
+	if !a.io.IsStdoutTTY() {
+		a.io.SetContentSanitization(false)
+	}
+	cmd.Stdout = a.io.ContentOut
+
 	tunnelClosed := make(chan error, 1)
 	go func() {
-		fwd := liveshare.NewPortForwarder(session, "sshd", remoteSSHServerPort, false)
-		tunnelClosed <- fwd.ForwardToListener(ctx, listen) // error is non-nil
+		opts := portforwarder.ForwardPortOpts{
+			Port:     remoteSSHServerPort,
+			Internal: true,
+		}
+		tunnelClosed <- fwd.ForwardPortToListener(ctx, opts, listen)
 	}()
 
 	cmdDone := make(chan error, 1)

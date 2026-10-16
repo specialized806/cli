@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,7 +17,8 @@ import (
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/gh/ghtelemetry"
 	"github.com/cli/cli/v2/internal/ghinstance"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/pkg/cmd/factory"
@@ -28,8 +30,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const (
+	ttyIndent = "  "
+)
+
 type ApiOptions struct {
-	IO *iostreams.IOStreams
+	AppVersion        string
+	InvokingAgent     string
+	BaseRepo          func() (ghrepo.Interface, error)
+	Branch            func() (string, error)
+	Config            func() (gh.Config, error)
+	HttpClient        func(api.HTTPClientOptions) (*http.Client, error)
+	IO                *iostreams.IOStreams
+	TelemetryDisabler ghtelemetry.Disabler
 
 	Hostname            string
 	RequestMethod       string
@@ -42,24 +55,26 @@ type ApiOptions struct {
 	Previews            []string
 	ShowResponseHeaders bool
 	Paginate            bool
+	Slurp               bool
 	Silent              bool
 	Template            string
 	CacheTTL            time.Duration
 	FilterOutput        string
+	Verbose             bool
 
-	Config     func() (config.Config, error)
-	HttpClient func() (*http.Client, error)
-	BaseRepo   func() (ghrepo.Interface, error)
-	Branch     func() (string, error)
+	AllowEscapeSequences bool
 }
 
 func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command {
 	opts := ApiOptions{
-		IO:         f.IOStreams,
-		Config:     f.Config,
-		HttpClient: f.HttpClient,
-		BaseRepo:   f.BaseRepo,
-		Branch:     f.Branch,
+		AppVersion:        f.AppVersion,
+		InvokingAgent:     f.InvokingAgent,
+		BaseRepo:          f.BaseRepo,
+		Branch:            f.Branch,
+		Config:            f.Config,
+		HttpClient:        api.NewHTTPClient,
+		IO:                f.IOStreams,
+		TelemetryDisabler: f.TelemetryDisabler,
 	}
 
 	cmd := &cobra.Command{
@@ -69,78 +84,97 @@ func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command 
 			Makes an authenticated HTTP request to the GitHub API and prints the response.
 
 			The endpoint argument should either be a path of a GitHub API v3 endpoint, or
-			"graphql" to access the GitHub API v4.
+			%[1]sgraphql%[1]s to access the GitHub API v4.
 
-			Placeholder values "{owner}", "{repo}", and "{branch}" in the endpoint
+			Placeholder values %[1]s{owner}%[1]s, %[1]s{repo}%[1]s, and %[1]s{branch}%[1]s in the endpoint
 			argument will get replaced with values from the repository of the current
-			directory or the repository specified in the GH_REPO environment variable.
+			directory or the repository specified in the %[1]sGH_REPO%[1]s environment variable.
 			Note that in some shells, for example PowerShell, you may need to enclose
-			any value that contains "{...}" in quotes to prevent the shell from
+			any value that contains %[1]s{...}%[1]s in quotes to prevent the shell from
 			applying special meaning to curly braces.
 
-			The default HTTP request method is "GET" normally and "POST" if any parameters
+			The %[1]s-p/--preview%[1]s flag enables opting into previews, which are feature-flagged,
+			experimental API endpoints or behaviors. The API expects opt-in via the %[1]sAccept%[1]s
+			header with format %[1]sapplication/vnd.github.<preview-name>-preview+json%[1]s and this
+			command facilitates that via %[1]s--preview <preview-name>%[1]s. To send a request for
+			the corsair and scarlet witch previews, you could use %[1]s-p corsair,scarlet-witch%[1]s
+			or %[1]s--preview corsair --preview scarlet-witch%[1]s.
+
+			The default HTTP request method is %[1]sGET%[1]s normally and %[1]sPOST%[1]s if any parameters
 			were added. Override the method with %[1]s--method%[1]s.
 
-			Pass one or more %[1]s-f/--raw-field%[1]s values in "key=value" format to add static string
+			Pass one or more %[1]s-f/--raw-field%[1]s values in %[1]skey=value%[1]s format to add static string
 			parameters to the request payload. To add non-string or placeholder-determined values, see
-			%[1]s--field%[1]s below. Note that adding request parameters will automatically switch the
-			request method to POST. To send the parameters as a GET query string instead, use
+			%[1]s-F/--field%[1]s below. Note that adding request parameters will automatically switch the
+			request method to %[1]sPOST%[1]s. To send the parameters as a %[1]sGET%[1]s query string instead, use
 			%[1]s--method GET%[1]s.
 
 			The %[1]s-F/--field%[1]s flag has magic type conversion based on the format of the value:
 
-			- literal values "true", "false", "null", and integer numbers get converted to
+			- literal values %[1]strue%[1]s, %[1]sfalse%[1]s, %[1]snull%[1]s, and integer numbers get converted to
 			  appropriate JSON types;
-			- placeholder values "{owner}", "{repo}", and "{branch}" get populated with values
+			- placeholder values %[1]s{owner}%[1]s, %[1]s{repo}%[1]s, and %[1]s{branch}%[1]s get populated with values
 			  from the repository of the current directory;
-			- if the value starts with "@", the rest of the value is interpreted as a
-			  filename to read the value from. Pass "-" to read from standard input.
+			- if the value starts with %[1]s@%[1]s, the rest of the value is interpreted as a
+			  filename to read the value from. Pass %[1]s-%[1]s to read from standard input.
 
-			For GraphQL requests, all fields other than "query" and "operationName" are
+			For GraphQL requests, all fields other than %[1]squery%[1]s and %[1]soperationName%[1]s are
 			interpreted as GraphQL variables.
 
-			To pass nested parameters in the request payload, use "key[subkey]=value" syntax when
+			To pass nested parameters in the request payload, use %[1]skey[subkey]=value%[1]s syntax when
 			declaring fields. To pass nested values as arrays, declare multiple fields with the
-			syntax "key[]=value1", "key[]=value2". To pass an empty array, use "key[]" without a
+			syntax %[1]skey[]=value1%[1]s, %[1]skey[]=value2%[1]s. To pass an empty array, use %[1]skey[]%[1]s without a
 			value.
 
 			To pass pre-constructed JSON or payloads in other formats, a request body may be read
-			from file specified by %[1]s--input%[1]s. Use "-" to read from standard input. When passing the
+			from file specified by %[1]s--input%[1]s. Use %[1]s-%[1]s to read from standard input. When passing the
 			request body this way, any parameters specified via field flags are added to the query
 			string of the endpoint URL.
 
 			In %[1]s--paginate%[1]s mode, all pages of results will sequentially be requested until
 			there are no more pages of results. For GraphQL requests, this requires that the
 			original query accepts an %[1]s$endCursor: String%[1]s variable and that it fetches the
-			%[1]spageInfo{ hasNextPage, endCursor }%[1]s set of fields from a collection.
+			%[1]spageInfo{ hasNextPage, endCursor }%[1]s set of fields from a collection. Each page is a separate
+			JSON array or object. Pass %[1]s--slurp%[1]s to wrap all pages of JSON arrays or objects
+			into an outer JSON array.
 		`, "`"),
 		Example: heredoc.Doc(`
-			# list releases in the current repository
+			# List releases in the current repository
 			$ gh api repos/{owner}/{repo}/releases
 
-			# post an issue comment
+			# Post an issue comment
 			$ gh api repos/{owner}/{repo}/issues/123/comments -f body='Hi from CLI'
 
-			# post nested parameter read from a file
+			# Post nested parameter read from a file
 			$ gh api gists -F 'files[myfile.txt][content]=@myfile.txt'
 
-			# add parameters to a GET request
+			# Add parameters to a GET request
 			$ gh api -X GET search/issues -f q='repo:cli/cli is:open remote'
 
-			# set a custom HTTP header
+			# Use a JSON file as request body
+			$ gh api repos/{owner}/{repo}/rulesets --input file.json
+
+			# Set a custom HTTP header
 			$ gh api -H 'Accept: application/vnd.github.v3.raw+json' ...
 
-			# opt into GitHub API previews
+			# Opt into GitHub API previews
 			$ gh api --preview baptiste,nebula ...
 
-			# print only specific fields from the response
+			# Print only specific fields from the response
 			$ gh api repos/{owner}/{repo}/issues --jq '.[].title'
 
-			# use a template for the output
+			# Use a template for the output
 			$ gh api repos/{owner}/{repo}/issues --template \
 			  '{{range .}}{{.title}} ({{.labels | pluck "name" | join ", " | color "yellow"}}){{"\n"}}{{end}}'
 
-			# list releases with GraphQL
+			# Update allowed values of the "environment" custom property in a deeply nested array
+			$ gh api -X PATCH /orgs/{org}/properties/schema \
+			   -F 'properties[][property_name]=environment' \
+			   -F 'properties[][default_value]=production' \
+			   -F 'properties[][allowed_values][]=staging' \
+			   -F 'properties[][allowed_values][]=production'
+
+			# List releases with GraphQL
 			$ gh api graphql -F owner='{owner}' -F name='{repo}' -f query='
 			  query($name: String!, $owner: String!) {
 			    repository(owner: $owner, name: $name) {
@@ -151,7 +185,7 @@ func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command 
 			  }
 			'
 
-			# list all repositories for a user
+			# List all repositories for a user
 			$ gh api graphql --paginate -f query='
 			  query($endCursor: String) {
 			    viewer {
@@ -165,21 +199,37 @@ func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command 
 			    }
 			  }
 			'
+
+			# Get the percentage of forks for the current user
+			$ gh api graphql --paginate --slurp -f query='
+			  query($endCursor: String) {
+			    viewer {
+			      repositories(first: 100, after: $endCursor) {
+			        nodes { isFork }
+			        pageInfo {
+			          hasNextPage
+			          endCursor
+			        }
+			      }
+			    }
+			  }
+			' | jq 'def count(e): reduce e as $_ (0;.+1);
+			[.[].data.viewer.repositories.nodes[]] as $r | count(select($r[].isFork))/count($r[])'
 		`),
 		Annotations: map[string]string{
-			"help:environment": heredoc.Doc(`
+			"help:environment": heredoc.Docf(`
 				GH_TOKEN, GITHUB_TOKEN (in order of precedence): an authentication token for
-				github.com API requests.
+				%[1]sgithub.com%[1]s API requests.
 
 				GH_ENTERPRISE_TOKEN, GITHUB_ENTERPRISE_TOKEN (in order of precedence): an
 				authentication token for API requests to GitHub Enterprise.
 
-				GH_HOST: make the request to a GitHub host other than github.com.
-			`),
+				GH_HOST: make the request to a GitHub host other than %[1]sgithub.com%[1]s.
+			`, "`"),
 		},
 		Args: cobra.ExactArgs(1),
 		PreRun: func(c *cobra.Command, args []string) {
-			opts.BaseRepo = cmdutil.OverrideBaseRepoFunc(f, "")
+			opts.BaseRepo = cmdutil.OverrideBaseRepoFunc(f.BaseRepo, "")
 		},
 		RunE: func(c *cobra.Command, args []string) error {
 			opts.RequestPath = args[0]
@@ -207,8 +257,24 @@ func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command 
 				return err
 			}
 
+			if opts.Slurp {
+				if err := cmdutil.MutuallyExclusive(
+					"the `--slurp` option is not supported with `--jq` or `--template`",
+					opts.Slurp,
+					opts.FilterOutput != "",
+					opts.Template != "",
+				); err != nil {
+					return err
+				}
+
+				if !opts.Paginate {
+					return cmdutil.FlagErrorf("`--paginate` required when passing `--slurp`")
+				}
+			}
+
 			if err := cmdutil.MutuallyExclusive(
-				"only one of `--template`, `--jq`, or `--silent` may be used",
+				"only one of `--template`, `--jq`, `--silent`, or `--verbose` may be used",
+				opts.Verbose,
 				opts.Silent,
 				opts.FilterOutput != "",
 				opts.Template != "",
@@ -225,17 +291,20 @@ func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command 
 
 	cmd.Flags().StringVar(&opts.Hostname, "hostname", "", "The GitHub hostname for the request (default \"github.com\")")
 	cmd.Flags().StringVarP(&opts.RequestMethod, "method", "X", "GET", "The HTTP method for the request")
-	cmd.Flags().StringArrayVarP(&opts.MagicFields, "field", "F", nil, "Add a typed parameter in `key=value` format")
+	cmd.Flags().StringArrayVarP(&opts.MagicFields, "field", "F", nil, "Add a typed parameter in `key=value` format (use \"@<path>\" or \"@-\" to read value from file or stdin)")
 	cmd.Flags().StringArrayVarP(&opts.RawFields, "raw-field", "f", nil, "Add a string parameter in `key=value` format")
 	cmd.Flags().StringArrayVarP(&opts.RequestHeaders, "header", "H", nil, "Add a HTTP request header in `key:value` format")
-	cmd.Flags().StringSliceVarP(&opts.Previews, "preview", "p", nil, "GitHub API preview `names` to request (without the \"-preview\" suffix)")
+	cmd.Flags().StringSliceVarP(&opts.Previews, "preview", "p", nil, "Opt into GitHub API previews (names should omit '-preview')")
 	cmd.Flags().BoolVarP(&opts.ShowResponseHeaders, "include", "i", false, "Include HTTP response status line and headers in the output")
+	cmd.Flags().BoolVar(&opts.Slurp, "slurp", false, "Use with \"--paginate\" to return an array of all pages of either JSON arrays or objects")
 	cmd.Flags().BoolVar(&opts.Paginate, "paginate", false, "Make additional HTTP requests to fetch all pages of results")
 	cmd.Flags().StringVar(&opts.RequestInputFile, "input", "", "The `file` to use as body for the HTTP request (use \"-\" to read from standard input)")
 	cmd.Flags().BoolVar(&opts.Silent, "silent", false, "Do not print the response body")
 	cmd.Flags().StringVarP(&opts.Template, "template", "t", "", "Format JSON output using a Go template; see \"gh help formatting\"")
 	cmd.Flags().StringVarP(&opts.FilterOutput, "jq", "q", "", "Query to select values from the response using jq syntax")
 	cmd.Flags().DurationVar(&opts.CacheTTL, "cache", 0, "Cache the response, e.g. \"3600s\", \"60m\", \"1h\"")
+	cmd.Flags().BoolVar(&opts.Verbose, "verbose", false, "Include full HTTP request and response in the output")
+	cmd.Flags().BoolVar(&opts.AllowEscapeSequences, "allow-escape-sequences", false, "Allow printing terminal escape sequences")
 	return cmd
 }
 
@@ -252,7 +321,7 @@ func apiRun(opts *ApiOptions) error {
 	}
 	method := opts.RequestMethod
 	requestHeaders := opts.RequestHeaders
-	var requestBody interface{}
+	var requestBody any
 	if len(params) > 0 {
 		requestBody = params
 	}
@@ -261,8 +330,44 @@ func apiRun(opts *ApiOptions) error {
 		method = "POST"
 	}
 
+	if !opts.Silent {
+		if err := opts.IO.StartPager(); err == nil {
+			defer opts.IO.StopPager()
+		} else {
+			fmt.Fprintf(opts.IO.ErrOut, "failed to start pager: %v\n", err)
+		}
+	}
+
+	// Response content funnels through ContentOut. It stays in passthrough here:
+	// JSON is sanitized by the transport and the jq/template/jsoncolor paths emit
+	// our own formatting, so only a raw non-JSON body needs neutralizing, done at
+	// its copy below.
+	opts.IO.SetContentSanitization(false)
+
+	var bodyWriter io.Writer = opts.IO.ContentOut
+	var headersWriter io.Writer = opts.IO.Out
+	if opts.Silent {
+		bodyWriter = io.Discard
+	}
+	if opts.Verbose {
+		// httpClient handles output when verbose flag is specified.
+		bodyWriter = io.Discard
+		headersWriter = io.Discard
+	}
+
 	if opts.Paginate && !isGraphQL {
 		requestPath = addPerPage(requestPath, 100, params)
+	}
+
+	// Similar to `jq --slurp`, write all pages JSON arrays or objects into a JSON array.
+	if opts.Paginate && opts.Slurp {
+		w := &jsonArrayWriter{
+			Writer: bodyWriter,
+			color:  opts.IO.ColorEnabled(),
+		}
+		defer w.Close()
+
+		bodyWriter = w
 	}
 
 	if opts.RequestInputFile != "" {
@@ -282,29 +387,29 @@ func apiRun(opts *ApiOptions) error {
 		requestHeaders = append(requestHeaders, "Accept: "+previewNamesToMIMETypes(opts.Previews))
 	}
 
-	httpClient, err := opts.HttpClient()
+	cfg, err := opts.Config()
 	if err != nil {
 		return err
 	}
-	if opts.CacheTTL > 0 {
-		httpClient = api.NewCachedHTTPClient(httpClient, opts.CacheTTL)
-	}
 
-	if !opts.Silent {
-		if err := opts.IO.StartPager(); err == nil {
-			defer opts.IO.StopPager()
-		} else {
-			fmt.Fprintf(opts.IO.ErrOut, "failed to start pager: %v\n", err)
-		}
+	if opts.HttpClient == nil {
+		opts.HttpClient = api.NewHTTPClient
 	}
-
-	var bodyWriter io.Writer = opts.IO.Out
-	var headersWriter io.Writer = opts.IO.Out
-	if opts.Silent {
-		bodyWriter = io.Discard
+	log := opts.IO.ErrOut
+	if opts.Verbose {
+		log = opts.IO.Out
 	}
-
-	cfg, err := opts.Config()
+	httpClient, err := opts.HttpClient(api.HTTPClientOptions{
+		AppVersion:        opts.AppVersion,
+		InvokingAgent:     opts.InvokingAgent,
+		CacheTTL:          opts.CacheTTL,
+		Config:            cfg.Authentication(),
+		EnableCache:       opts.CacheTTL > 0,
+		Log:               log,
+		LogColorize:       opts.IO.ColorEnabled(),
+		LogVerboseHTTP:    opts.Verbose,
+		TelemetryDisabler: opts.TelemetryDisabler,
+	})
 	if err != nil {
 		return err
 	}
@@ -315,23 +420,38 @@ func apiRun(opts *ApiOptions) error {
 		host = opts.Hostname
 	}
 
+	apiHost, _ := cfg.Authentication().APIHostForHost(host)
+
 	tmpl := template.New(bodyWriter, opts.IO.TerminalWidth(), opts.IO.ColorEnabled())
 	err = tmpl.Parse(opts.Template)
 	if err != nil {
 		return err
 	}
 
+	isFirstPage := true
 	hasNextPage := true
 	for hasNextPage {
-		resp, err := httpRequest(httpClient, host, method, requestPath, requestBody, requestHeaders)
+		resp, err := httpRequest(httpClient, host, apiHost, method, requestPath, requestBody, requestHeaders)
 		if err != nil {
 			return err
 		}
 
-		endCursor, err := processResponse(resp, opts, bodyWriter, headersWriter, tmpl)
+		if !isGraphQL {
+			requestPath, hasNextPage = findNextPage(resp)
+			requestBody = nil // prevent repeating GET parameters
+		}
+
+		// Tell optional jsonArrayWriter to start a new page.
+		err = startPage(bodyWriter)
 		if err != nil {
 			return err
 		}
+
+		endCursor, err := processResponse(resp, opts, bodyWriter, headersWriter, tmpl, isFirstPage, !hasNextPage)
+		if err != nil {
+			return err
+		}
+		isFirstPage = false
 
 		if !opts.Paginate {
 			break
@@ -342,9 +462,6 @@ func apiRun(opts *ApiOptions) error {
 			if hasNextPage {
 				params["endCursor"] = endCursor
 			}
-		} else {
-			requestPath, hasNextPage = findNextPage(resp)
-			requestBody = nil // prevent repeating GET parameters
 		}
 
 		if hasNextPage && opts.ShowResponseHeaders {
@@ -355,7 +472,9 @@ func apiRun(opts *ApiOptions) error {
 	return tmpl.Flush()
 }
 
-func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersWriter io.Writer, template *template.Template) (endCursor string, err error) {
+var jsonContentTypeRE = regexp.MustCompile(`[/+]json(;|$)`)
+
+func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersWriter io.Writer, template *template.Template, isFirstPage, isLastPage bool) (endCursor string, err error) {
 	if opts.ShowResponseHeaders {
 		fmt.Fprintln(headersWriter, resp.Proto, resp.Status)
 		printHeaders(headersWriter, resp.Header, opts.IO.ColorEnabled())
@@ -368,13 +487,15 @@ func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersW
 	var responseBody io.Reader = resp.Body
 	defer resp.Body.Close()
 
-	isJSON, _ := regexp.MatchString(`[/+]json(;|$)`, resp.Header.Get("Content-Type"))
+	isJSON := jsonContentTypeRE.MatchString(resp.Header.Get("Content-Type"))
 
 	var serverError string
 	if isJSON && (opts.RequestPath == "graphql" || resp.StatusCode >= 400) {
-		responseBody, serverError, err = parseErrorResponse(responseBody, resp.StatusCode)
-		if err != nil {
-			return
+		if !strings.EqualFold(opts.RequestMethod, "HEAD") {
+			responseBody, serverError, err = parseErrorResponse(responseBody, resp.StatusCode)
+			if err != nil {
+				return
+			}
 		}
 	}
 
@@ -387,7 +508,11 @@ func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersW
 
 	if opts.FilterOutput != "" && serverError == "" {
 		// TODO: reuse parsed query across pagination invocations
-		err = jq.Evaluate(responseBody, bodyWriter, opts.FilterOutput)
+		indent := ""
+		if opts.IO.IsStdoutTTY() {
+			indent = ttyIndent
+		}
+		err = jq.EvaluateFormatted(responseBody, bodyWriter, opts.FilterOutput, indent, opts.IO.ColorEnabled())
 		if err != nil {
 			return
 		}
@@ -397,9 +522,29 @@ func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersW
 			return
 		}
 	} else if isJSON && opts.IO.ColorEnabled() {
-		err = jsoncolor.Write(bodyWriter, responseBody, "  ")
+		err = jsoncolor.Write(bodyWriter, responseBody, ttyIndent)
 	} else {
-		_, err = io.Copy(bodyWriter, responseBody)
+		if isJSON && opts.Paginate && !opts.Slurp && !isGraphQLPaginate && !opts.ShowResponseHeaders {
+			responseBody = &paginatedArrayReader{
+				Reader:      responseBody,
+				isFirstPage: isFirstPage,
+				isLastPage:  isLastPage,
+			}
+		}
+		// A raw non-JSON body is the only response the transport does not sanitize.
+		// It is faithful byte output, so binary bound for a terminal and text
+		// carrying escape sequences are refused; the opt-out flag and discarded
+		// output stream verbatim.
+		if !isJSON && !opts.AllowEscapeSequences && bodyWriter != io.Discard {
+			err = iostreams.CopyGuardedContent(bodyWriter, responseBody, opts.IO.IsStdoutTTY())
+			if binErr, ok := errors.AsType[iostreams.BinaryTerminalError](err); ok {
+				err = fmt.Errorf("%w; redirect or pipe stdout to save it, or pass --allow-escape-sequences to output it anyway", binErr)
+			} else if errors.Is(err, iostreams.ErrEscapeSequence) {
+				err = errors.New("the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway")
+			}
+		} else {
+			_, err = io.Copy(bodyWriter, responseBody)
+		}
 	}
 	if err != nil {
 		return
@@ -454,6 +599,11 @@ func fillPlaceholders(value string, opts *ApiOptions) (string, error) {
 				err = e
 			}
 		case "branch":
+			if os.Getenv("GH_REPO") != "" {
+				err = errors.New("unable to determine an appropriate value for the 'branch' placeholder")
+				return m
+			}
+
 			if branch, e := opts.Branch(); e == nil {
 				return branch
 			} else {

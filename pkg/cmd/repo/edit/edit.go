@@ -7,28 +7,39 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
 	fd "github.com/cli/cli/v2/internal/featuredetection"
-	"github.com/cli/cli/v2/internal/ghinstance"
 	"github.com/cli/cli/v2/internal/ghrepo"
-	"github.com/cli/cli/v2/internal/prompter"
+	"github.com/cli/cli/v2/internal/safeurl"
+	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/cli/cli/v2/pkg/set"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 )
 
+type iprompter interface {
+	MultiSelect(prompt string, defaults []string, options []string) ([]int, error)
+	Input(string, string) (string, error)
+	Confirm(string, bool) (bool, error)
+	Select(string, string, []string) (int, error)
+}
+
 const (
 	allowMergeCommits = "Allow Merge Commits"
 	allowSquashMerge  = "Allow Squash Merging"
 	allowRebaseMerge  = "Allow Rebase Merging"
+
+	squashMsgDefault            = "default"
+	squashMsgPRTitle            = "pr-title"
+	squashMsgPRTitleCommits     = "pr-title-commits"
+	squashMsgPRTitleDescription = "pr-title-description"
 
 	optionAllowForking      = "Allow Forking"
 	optionDefaultBranchName = "Default Branch Name"
@@ -37,45 +48,56 @@ const (
 	optionIssues            = "Issues"
 	optionMergeOptions      = "Merge Options"
 	optionProjects          = "Projects"
-	optionDiscussions       = "Discussions"
 	optionTemplateRepo      = "Template Repository"
 	optionTopics            = "Topics"
 	optionVisibility        = "Visibility"
 	optionWikis             = "Wikis"
+
+	// TODO: GitHub Enterprise Server does not support has_discussions yet
+	// optionDiscussions = "Discussions"
 )
 
 type EditOptions struct {
-	HTTPClient      *http.Client
-	Repository      ghrepo.Interface
-	IO              *iostreams.IOStreams
-	Edits           EditRepositoryInput
-	AddTopics       []string
-	RemoveTopics    []string
-	InteractiveMode bool
-	Detector        fd.Detector
-	Prompter        prompter.Prompter
+	HTTPClient                         *http.Client
+	Repository                         ghrepo.Interface
+	IO                                 *iostreams.IOStreams
+	Edits                              EditRepositoryInput
+	AddTopics                          []string
+	RemoveTopics                       []string
+	AcceptVisibilityChangeConsequences bool
+	InteractiveMode                    bool
+	Detector                           fd.Detector
+	Prompter                           iprompter
 	// Cache of current repo topics to avoid retrieving them
 	// in multiple flows.
 	topicsCache []string
 }
 
 type EditRepositoryInput struct {
-	AllowForking        *bool   `json:"allow_forking,omitempty"`
-	AllowUpdateBranch   *bool   `json:"allow_update_branch,omitempty"`
-	DefaultBranch       *string `json:"default_branch,omitempty"`
-	DeleteBranchOnMerge *bool   `json:"delete_branch_on_merge,omitempty"`
-	Description         *string `json:"description,omitempty"`
-	EnableAutoMerge     *bool   `json:"allow_auto_merge,omitempty"`
-	EnableIssues        *bool   `json:"has_issues,omitempty"`
-	EnableMergeCommit   *bool   `json:"allow_merge_commit,omitempty"`
-	EnableProjects      *bool   `json:"has_projects,omitempty"`
-	EnableDiscussions   *bool   `json:"has_discussions,omitempty"`
-	EnableRebaseMerge   *bool   `json:"allow_rebase_merge,omitempty"`
-	EnableSquashMerge   *bool   `json:"allow_squash_merge,omitempty"`
-	EnableWiki          *bool   `json:"has_wiki,omitempty"`
-	Homepage            *string `json:"homepage,omitempty"`
-	IsTemplate          *bool   `json:"is_template,omitempty"`
-	Visibility          *string `json:"visibility,omitempty"`
+	enableAdvancedSecurity             *bool
+	enableSecretScanning               *bool
+	enableSecretScanningPushProtection *bool
+	squashMergeCommitMsg               *string
+
+	AllowForking             *bool                     `json:"allow_forking,omitempty"`
+	AllowUpdateBranch        *bool                     `json:"allow_update_branch,omitempty"`
+	DefaultBranch            *string                   `json:"default_branch,omitempty"`
+	DeleteBranchOnMerge      *bool                     `json:"delete_branch_on_merge,omitempty"`
+	Description              *string                   `json:"description,omitempty"`
+	EnableAutoMerge          *bool                     `json:"allow_auto_merge,omitempty"`
+	EnableIssues             *bool                     `json:"has_issues,omitempty"`
+	EnableMergeCommit        *bool                     `json:"allow_merge_commit,omitempty"`
+	EnableProjects           *bool                     `json:"has_projects,omitempty"`
+	EnableDiscussions        *bool                     `json:"has_discussions,omitempty"`
+	EnableRebaseMerge        *bool                     `json:"allow_rebase_merge,omitempty"`
+	EnableSquashMerge        *bool                     `json:"allow_squash_merge,omitempty"`
+	EnableWiki               *bool                     `json:"has_wiki,omitempty"`
+	Homepage                 *string                   `json:"homepage,omitempty"`
+	IsTemplate               *bool                     `json:"is_template,omitempty"`
+	SecurityAndAnalysis      *SecurityAndAnalysisInput `json:"security_and_analysis,omitempty"`
+	SquashMergeCommitTitle   *string                   `json:"squash_merge_commit_title,omitempty"`
+	SquashMergeCommitMessage *string                   `json:"squash_merge_commit_message,omitempty"`
+	Visibility               *string                   `json:"visibility,omitempty"`
 }
 
 func NewCmdEdit(f *cmdutil.Factory, runF func(options *EditOptions) error) *cobra.Command {
@@ -97,17 +119,34 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(options *EditOptions) error) *cobr
 		Long: heredoc.Docf(`
 			Edit repository settings.
 
-			To toggle a setting off, use the %[1]s--flag=false%[1]s syntax.
+			To toggle a setting off, use the %[1]s--<flag>=false%[1]s syntax.
 
-			Note that changing repository visibility to private will cause loss of stars and watchers.
-		`, "`"),
+			Changing repository visibility can have unexpected consequences including but not limited to:
+
+			- Losing stars and watchers, affecting repository ranking
+			- Detaching public forks from the network
+			- Disabling push rulesets
+			- Allowing access to GitHub Actions history and logs
+
+			When the %[1]s--visibility%[1]s flag is used, %[1]s--accept-visibility-change-consequences%[1]s flag is required.
+
+			For information on all the potential consequences, see <https://gh.io/setting-repository-visibility>.
+
+			When the %[1]s--enable-squash-merge%[1]s flag is used, %[1]s--squash-merge-commit-message%[1]s
+			can be used to change the default squash merge commit message behavior:
+
+			- %[1]s%[2]s%[1]s: uses commit title and message for 1 commit, or pull request title and list of commits for 2 or more
+			- %[1]s%[3]s%[1]s: uses pull request title
+			- %[1]s%[4]s%[1]s: uses pull request title and list of commits
+			- %[1]s%[5]s%[1]s: uses pull request title and description
+		`, "`", squashMsgDefault, squashMsgPRTitle, squashMsgPRTitleCommits, squashMsgPRTitleDescription),
 		Args: cobra.MaximumNArgs(1),
 		Example: heredoc.Doc(`
-			# enable issues and wiki
-			gh repo edit --enable-issues --enable-wiki
+			# Enable issues and wiki
+			$ gh repo edit --enable-issues --enable-wiki
 
-			# disable projects
-			gh repo edit --enable-projects=false
+			# Disable projects
+			$ gh repo edit --enable-projects=false
 		`),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) > 0 {
@@ -138,6 +177,27 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(options *EditOptions) error) *cobr
 				return cmdutil.FlagErrorf("specify properties to edit when not running interactively")
 			}
 
+			if opts.Edits.Visibility != nil && !opts.AcceptVisibilityChangeConsequences {
+				return cmdutil.FlagErrorf("use of --visibility flag requires --accept-visibility-change-consequences flag")
+			}
+
+			if opts.Edits.squashMergeCommitMsg != nil {
+				if opts.Edits.EnableSquashMerge == nil {
+					return cmdutil.FlagErrorf("--squash-merge-commit-message requires --enable-squash-merge")
+				}
+				if !*opts.Edits.EnableSquashMerge {
+					return cmdutil.FlagErrorf("--squash-merge-commit-message cannot be used when --enable-squash-merge=false")
+				}
+				if err := validateSquashMergeCommitMsg(*opts.Edits.squashMergeCommitMsg); err != nil {
+					return err
+				}
+				transformSquashMergeOpts(&opts.Edits)
+			}
+
+			if hasSecurityEdits(opts.Edits) {
+				opts.Edits.SecurityAndAnalysis = transformSecurityAndAnalysisOpts(opts)
+			}
+
 			if runF != nil {
 				return runF(opts)
 			}
@@ -158,11 +218,16 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(options *EditOptions) error) *cobr
 	cmdutil.NilBoolFlag(cmd, &opts.Edits.EnableSquashMerge, "enable-squash-merge", "", "Enable merging pull requests via squashed commit")
 	cmdutil.NilBoolFlag(cmd, &opts.Edits.EnableRebaseMerge, "enable-rebase-merge", "", "Enable merging pull requests via rebase")
 	cmdutil.NilBoolFlag(cmd, &opts.Edits.EnableAutoMerge, "enable-auto-merge", "", "Enable auto-merge functionality")
+	cmdutil.NilBoolFlag(cmd, &opts.Edits.enableAdvancedSecurity, "enable-advanced-security", "", "Enable advanced security in the repository")
+	cmdutil.NilBoolFlag(cmd, &opts.Edits.enableSecretScanning, "enable-secret-scanning", "", "Enable secret scanning in the repository")
+	cmdutil.NilBoolFlag(cmd, &opts.Edits.enableSecretScanningPushProtection, "enable-secret-scanning-push-protection", "", "Enable secret scanning push protection in the repository. Secret scanning must be enabled first")
 	cmdutil.NilBoolFlag(cmd, &opts.Edits.DeleteBranchOnMerge, "delete-branch-on-merge", "", "Delete head branch when pull requests are merged")
 	cmdutil.NilBoolFlag(cmd, &opts.Edits.AllowForking, "allow-forking", "", "Allow forking of an organization repository")
 	cmdutil.NilBoolFlag(cmd, &opts.Edits.AllowUpdateBranch, "allow-update-branch", "", "Allow a pull request head branch that is behind its base branch to be updated")
+	cmdutil.NilStringFlag(cmd, &opts.Edits.squashMergeCommitMsg, "squash-merge-commit-message", "", "The default value for a squash merge commit message: {default|pr-title|pr-title-commits|pr-title-description}")
 	cmd.Flags().StringSliceVar(&opts.AddTopics, "add-topic", nil, "Add repository topic")
 	cmd.Flags().StringSliceVar(&opts.RemoveTopics, "remove-topic", nil, "Remove repository topic")
+	cmd.Flags().BoolVar(&opts.AcceptVisibilityChangeConsequences, "accept-visibility-change-consequences", false, "Accept the consequences of changing the repository visibility")
 
 	return cmd
 }
@@ -201,9 +266,11 @@ func editRun(ctx context.Context, opts *EditOptions) error {
 			"squashMergeAllowed",
 			"watchers",
 		}
+		// TODO repoFeaturesCleanup
 		if repoFeatures.VisibilityField {
 			fieldsToRetrieve = append(fieldsToRetrieve, "visibility")
 		}
+		// TODO repoFeaturesCleanup
 		if repoFeatures.AutoMerge {
 			fieldsToRetrieve = append(fieldsToRetrieve, "autoMergeAllowed")
 		}
@@ -220,7 +287,21 @@ func editRun(ctx context.Context, opts *EditOptions) error {
 		}
 	}
 
-	apiPath := fmt.Sprintf("repos/%s/%s", repo.RepoOwner(), repo.RepoName())
+	if opts.Edits.SecurityAndAnalysis != nil {
+		apiClient := api.NewClientFromHTTP(opts.HTTPClient)
+		repo, err := api.FetchRepository(apiClient, opts.Repository, []string{"viewerCanAdminister"})
+		if err != nil {
+			return err
+		}
+		if !repo.ViewerCanAdminister {
+			return fmt.Errorf("you do not have sufficient permissions to edit repository security and analysis features")
+		}
+	}
+
+	apiPath, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName())
+	if err != nil {
+		return err
+	}
 
 	body := &bytes.Buffer{}
 	enc := json.NewEncoder(body)
@@ -263,7 +344,7 @@ func editRun(ctx context.Context, opts *EditOptions) error {
 		})
 	}
 
-	err := g.Wait()
+	err = g.Wait()
 	if err != nil {
 		return err
 	}
@@ -279,7 +360,7 @@ func editRun(ctx context.Context, opts *EditOptions) error {
 	return nil
 }
 
-func interactiveChoice(r *api.Repository) ([]string, error) {
+func interactiveChoice(p iprompter, r *api.Repository) ([]string, error) {
 	options := []string{
 		optionDefaultBranchName,
 		optionDescription,
@@ -298,11 +379,14 @@ func interactiveChoice(r *api.Repository) ([]string, error) {
 		options = append(options, optionAllowForking)
 	}
 	var answers []string
-	//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-	err := prompt.SurveyAskOne(&survey.MultiSelect{
-		Message: "What do you want to edit?",
-		Options: options,
-	}, &answers, survey.WithPageSize(11))
+	selected, err := p.MultiSelect("What do you want to edit?", nil, options)
+	if err != nil {
+		return nil, err
+	}
+	for _, i := range selected {
+		answers = append(answers, options[i])
+	}
+
 	return answers, err
 }
 
@@ -310,38 +394,27 @@ func interactiveRepoEdit(opts *EditOptions, r *api.Repository) error {
 	for _, v := range r.RepositoryTopics.Nodes {
 		opts.topicsCache = append(opts.topicsCache, v.Topic.Name)
 	}
-	choices, err := interactiveChoice(r)
+	p := opts.Prompter
+	choices, err := interactiveChoice(p, r)
 	if err != nil {
 		return err
 	}
 	for _, c := range choices {
 		switch c {
 		case optionDescription:
-			opts.Edits.Description = &r.Description
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Input{
-				Message: "Description of the repository",
-				Default: r.Description,
-			}, opts.Edits.Description)
+			answer, err := p.Input("Description of the repository", r.Description)
 			if err != nil {
 				return err
 			}
+			opts.Edits.Description = &answer
 		case optionHomePageURL:
-			opts.Edits.Homepage = &r.HomepageURL
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Input{
-				Message: "Repository home page URL",
-				Default: r.HomepageURL,
-			}, opts.Edits.Homepage)
+			a, err := p.Input("Repository home page URL", r.HomepageURL)
 			if err != nil {
 				return err
 			}
+			opts.Edits.Homepage = &a
 		case optionTopics:
-			var addTopics string
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Input{
-				Message: "Add topics?(csv format)",
-			}, &addTopics)
+			addTopics, err := p.Input("Add topics?(csv format)", "")
 			if err != nil {
 				return err
 			}
@@ -350,84 +423,59 @@ func interactiveRepoEdit(opts *EditOptions, r *api.Repository) error {
 			}
 
 			if len(opts.topicsCache) > 0 {
-				//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-				err = prompt.SurveyAskOne(&survey.MultiSelect{
-					Message: "Remove Topics",
-					Options: opts.topicsCache,
-				}, &opts.RemoveTopics)
+				selected, err := p.MultiSelect("Remove Topics", nil, opts.topicsCache)
 				if err != nil {
 					return err
+				}
+				for _, i := range selected {
+					opts.RemoveTopics = append(opts.RemoveTopics, opts.topicsCache[i])
 				}
 			}
 		case optionDefaultBranchName:
-			opts.Edits.DefaultBranch = &r.DefaultBranchRef.Name
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Input{
-				Message: "Default branch name",
-				Default: r.DefaultBranchRef.Name,
-			}, opts.Edits.DefaultBranch)
+			name, err := p.Input("Default branch name", r.DefaultBranchRef.Name)
 			if err != nil {
 				return err
 			}
+			opts.Edits.DefaultBranch = &name
 		case optionWikis:
-			opts.Edits.EnableWiki = &r.HasWikiEnabled
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Confirm{
-				Message: "Enable Wikis?",
-				Default: r.HasWikiEnabled,
-			}, opts.Edits.EnableWiki)
+			c, err := p.Confirm("Enable Wikis?", r.HasWikiEnabled)
 			if err != nil {
 				return err
 			}
+			opts.Edits.EnableWiki = &c
 		case optionIssues:
-			opts.Edits.EnableIssues = &r.HasIssuesEnabled
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Confirm{
-				Message: "Enable Issues?",
-				Default: r.HasIssuesEnabled,
-			}, opts.Edits.EnableIssues)
+			a, err := p.Confirm("Enable Issues?", r.HasIssuesEnabled)
 			if err != nil {
 				return err
 			}
+			opts.Edits.EnableIssues = &a
 		case optionProjects:
-			opts.Edits.EnableProjects = &r.HasProjectsEnabled
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Confirm{
-				Message: "Enable Projects?",
-				Default: r.HasProjectsEnabled,
-			}, opts.Edits.EnableProjects)
+			a, err := p.Confirm("Enable Projects?", r.HasProjectsEnabled)
 			if err != nil {
 				return err
 			}
-		case optionDiscussions:
-			opts.Edits.EnableDiscussions = &r.HasDiscussionsEnabled
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Confirm{
-				Message: "Enable Discussions?",
-				Default: r.HasDiscussionsEnabled,
-			}, opts.Edits.EnableDiscussions)
-			if err != nil {
-				return err
-			}
+			opts.Edits.EnableProjects = &a
 		case optionVisibility:
-			opts.Edits.Visibility = &r.Visibility
+			cs := opts.IO.ColorScheme()
+			fmt.Fprintf(opts.IO.ErrOut, "%s Danger zone: changing repository visibility can have unexpected consequences; consult https://gh.io/setting-repository-visibility before continuing.\n", cs.WarningIcon())
+
 			visibilityOptions := []string{"public", "private", "internal"}
-			selected, err := opts.Prompter.Select("Visibility", strings.ToLower(r.Visibility), visibilityOptions)
+			selected, err := p.Select("Visibility", strings.ToLower(r.Visibility), visibilityOptions)
 			if err != nil {
 				return err
 			}
-			confirmed := true
-			if visibilityOptions[selected] == "private" &&
-				(r.StargazerCount > 0 || r.Watchers.TotalCount > 0) {
-				cs := opts.IO.ColorScheme()
-				fmt.Fprintf(opts.IO.ErrOut, "%s Changing the repository visibility to private will cause permanent loss of stars and watchers.\n", cs.WarningIcon())
-				confirmed, err = opts.Prompter.Confirm("Do you want to change visibility to private?", false)
-				if err != nil {
-					return err
-				}
+			selectedVisibility := visibilityOptions[selected]
+
+			if selectedVisibility != r.Visibility && (r.StargazerCount > 0 || r.Watchers.TotalCount > 0) {
+				fmt.Fprintf(opts.IO.ErrOut, "%s Changing the repository visibility to %s will cause permanent loss of %s and %s.\n", cs.WarningIcon(), selectedVisibility, text.Pluralize(r.StargazerCount, "star"), text.Pluralize(r.Watchers.TotalCount, "watcher"))
+			}
+
+			confirmed, err := p.Confirm(fmt.Sprintf("Do you want to change visibility to %s?", selectedVisibility), false)
+			if err != nil {
+				return err
 			}
 			if confirmed {
-				opts.Edits.Visibility = &visibilityOptions[selected]
+				opts.Edits.Visibility = &selectedVisibility
 			}
 		case optionMergeOptions:
 			var defaultMergeOptions []string
@@ -441,14 +489,16 @@ func interactiveRepoEdit(opts *EditOptions, r *api.Repository) error {
 			if r.RebaseMergeAllowed {
 				defaultMergeOptions = append(defaultMergeOptions, allowRebaseMerge)
 			}
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.MultiSelect{
-				Message: "Allowed merge strategies",
-				Default: defaultMergeOptions,
-				Options: []string{allowMergeCommits, allowSquashMerge, allowRebaseMerge},
-			}, &selectedMergeOptions)
+			mergeOpts := []string{allowMergeCommits, allowSquashMerge, allowRebaseMerge}
+			selected, err := p.MultiSelect(
+				"Allowed merge strategies",
+				defaultMergeOptions,
+				mergeOpts)
 			if err != nil {
 				return err
+			}
+			for _, i := range selected {
+				selectedMergeOptions = append(selectedMergeOptions, mergeOpts[i])
 			}
 			enableMergeCommit := isIncluded(allowMergeCommits, selectedMergeOptions)
 			opts.Edits.EnableMergeCommit = &enableMergeCommit
@@ -460,45 +510,48 @@ func interactiveRepoEdit(opts *EditOptions, r *api.Repository) error {
 				return fmt.Errorf("you need to allow at least one merge strategy")
 			}
 
-			opts.Edits.EnableAutoMerge = &r.AutoMergeAllowed
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Confirm{
-				Message: "Enable Auto Merge?",
-				Default: r.AutoMergeAllowed,
-			}, opts.Edits.EnableAutoMerge)
-			if err != nil {
-				return err
+			if enableSquashMerge {
+				squashMsgOptions := validSquashMsgValues
+				idx, err := p.Select(
+					"Default squash merge commit message",
+					squashMsgDefault,
+					squashMsgOptions)
+				if err != nil {
+					return err
+				}
+				selected := squashMsgOptions[idx]
+				opts.Edits.squashMergeCommitMsg = &selected
+				transformSquashMergeOpts(&opts.Edits)
 			}
 
+			opts.Edits.EnableAutoMerge = &r.AutoMergeAllowed
+			c, err := p.Confirm("Enable Auto Merge?", r.AutoMergeAllowed)
+			if err != nil {
+				return err
+			}
+			opts.Edits.EnableAutoMerge = &c
+
 			opts.Edits.DeleteBranchOnMerge = &r.DeleteBranchOnMerge
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Confirm{
-				Message: "Automatically delete head branches after merging?",
-				Default: r.DeleteBranchOnMerge,
-			}, opts.Edits.DeleteBranchOnMerge)
+			c, err = p.Confirm(
+				"Automatically delete head branches after merging?", r.DeleteBranchOnMerge)
 			if err != nil {
 				return err
 			}
+			opts.Edits.DeleteBranchOnMerge = &c
 		case optionTemplateRepo:
-			opts.Edits.IsTemplate = &r.IsTemplate
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Confirm{
-				Message: "Convert into a template repository?",
-				Default: r.IsTemplate,
-			}, opts.Edits.IsTemplate)
+			c, err := p.Confirm("Convert into a template repository?", r.IsTemplate)
 			if err != nil {
 				return err
 			}
+			opts.Edits.IsTemplate = &c
 		case optionAllowForking:
-			opts.Edits.AllowForking = &r.ForkingAllowed
-			//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-			err = prompt.SurveyAskOne(&survey.Confirm{
-				Message: "Allow forking (of an organization repository)?",
-				Default: r.ForkingAllowed,
-			}, opts.Edits.AllowForking)
+			c, err := p.Confirm(
+				"Allow forking (of an organization repository)?",
+				r.ForkingAllowed)
 			if err != nil {
 				return err
 			}
+			opts.Edits.AllowForking = &c
 		}
 	}
 	return nil
@@ -513,20 +566,24 @@ func parseTopics(s string) []string {
 }
 
 func getTopics(ctx context.Context, httpClient *http.Client, repo ghrepo.Interface) ([]string, error) {
-	apiPath := fmt.Sprintf("repos/%s/%s/topics", repo.RepoOwner(), repo.RepoName())
-	req, err := http.NewRequestWithContext(ctx, "GET", ghinstance.RESTPrefix(repo.RepoHost())+apiPath, nil)
+	path, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "topics")
 	if err != nil {
 		return nil, err
 	}
 
 	// "mercy-preview" is still needed for some GitHub Enterprise versions
-	req.Header.Set("Accept", "application/vnd.github.mercy-preview+json")
-	res, err := httpClient.Do(req)
+	// TODO(api-client-rollout)
+	// This line of code is part of a mechanical roll out of the api client.
+	// As a follow up, consider whether the api client can be injected to this call site, rather than constructed
+	res, err := api.NewClientFromHTTP(httpClient).RequestWithContext(ctx, repo.RepoHost(), http.MethodGet, path.String(), nil,
+		api.WithHeader("Accept", "application/vnd.github.mercy-preview+json"))
 	if err != nil {
 		return nil, err
 	}
+	defer res.Body.Close()
+
 	if res.StatusCode != http.StatusOK {
-		return nil, api.HandleHTTPError(res)
+		return nil, api.UnexpectedStatusError(res)
 	}
 
 	var responseData struct {
@@ -549,22 +606,25 @@ func setTopics(ctx context.Context, httpClient *http.Client, repo ghrepo.Interfa
 		return err
 	}
 
-	apiPath := fmt.Sprintf("repos/%s/%s/topics", repo.RepoOwner(), repo.RepoName())
-	req, err := http.NewRequestWithContext(ctx, "PUT", ghinstance.RESTPrefix(repo.RepoHost())+apiPath, body)
+	path, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "topics")
 	if err != nil {
 		return err
 	}
 
-	req.Header.Set("Content-type", "application/json")
 	// "mercy-preview" is still needed for some GitHub Enterprise versions
-	req.Header.Set("Accept", "application/vnd.github.mercy-preview+json")
-	res, err := httpClient.Do(req)
+	// TODO(api-client-rollout)
+	// This line of code is part of a mechanical roll out of the api client.
+	// As a follow up, consider whether the api client can be injected to this call site, rather than constructed
+	res, err := api.NewClientFromHTTP(httpClient).RequestWithContext(ctx, repo.RepoHost(), http.MethodPut, path.String(), body,
+		api.WithHeader("Content-Type", "application/json"),
+		api.WithHeader("Accept", "application/vnd.github.mercy-preview+json"))
 	if err != nil {
 		return err
 	}
+	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return api.HandleHTTPError(res)
+		return api.UnexpectedStatusError(res)
 	}
 
 	if res.Body != nil {
@@ -581,4 +641,86 @@ func isIncluded(value string, opts []string) bool {
 		}
 	}
 	return false
+}
+
+func boolToStatus(status bool) *string {
+	var result string
+	if status {
+		result = "enabled"
+	} else {
+		result = "disabled"
+	}
+	return &result
+}
+
+func hasSecurityEdits(edits EditRepositoryInput) bool {
+	return edits.enableAdvancedSecurity != nil || edits.enableSecretScanning != nil || edits.enableSecretScanningPushProtection != nil
+}
+
+type SecurityAndAnalysisInput struct {
+	EnableAdvancedSecurity             *SecurityAndAnalysisStatus `json:"advanced_security,omitempty"`
+	EnableSecretScanning               *SecurityAndAnalysisStatus `json:"secret_scanning,omitempty"`
+	EnableSecretScanningPushProtection *SecurityAndAnalysisStatus `json:"secret_scanning_push_protection,omitempty"`
+}
+
+type SecurityAndAnalysisStatus struct {
+	Status *string `json:"status,omitempty"`
+}
+
+// Transform security and analysis parameters to properly serialize EditRepositoryInput
+// See API Docs: https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28#update-a-repository
+func transformSecurityAndAnalysisOpts(opts *EditOptions) *SecurityAndAnalysisInput {
+	securityOptions := &SecurityAndAnalysisInput{}
+	if opts.Edits.enableAdvancedSecurity != nil {
+		securityOptions.EnableAdvancedSecurity = &SecurityAndAnalysisStatus{
+			Status: boolToStatus(*opts.Edits.enableAdvancedSecurity),
+		}
+	}
+	if opts.Edits.enableSecretScanning != nil {
+		securityOptions.EnableSecretScanning = &SecurityAndAnalysisStatus{
+			Status: boolToStatus(*opts.Edits.enableSecretScanning),
+		}
+	}
+	if opts.Edits.enableSecretScanningPushProtection != nil {
+		securityOptions.EnableSecretScanningPushProtection = &SecurityAndAnalysisStatus{
+			Status: boolToStatus(*opts.Edits.enableSecretScanningPushProtection),
+		}
+	}
+	return securityOptions
+}
+
+var validSquashMsgValues = []string{squashMsgDefault, squashMsgPRTitle, squashMsgPRTitleCommits, squashMsgPRTitleDescription}
+
+func validateSquashMergeCommitMsg(value string) error {
+	if slices.Contains(validSquashMsgValues, value) {
+		return nil
+	}
+	return cmdutil.FlagErrorf("invalid value for --squash-merge-commit-message: %q. Valid values are: %s", value, strings.Join(validSquashMsgValues, ", "))
+}
+
+// transformSquashMergeOpts maps the user-facing squash merge commit message option
+// to the two API fields: squash_merge_commit_title and squash_merge_commit_message.
+func transformSquashMergeOpts(edits *EditRepositoryInput) {
+	if edits.squashMergeCommitMsg == nil {
+		return
+	}
+	var title, message string
+	switch *edits.squashMergeCommitMsg {
+	case squashMsgDefault:
+		title = "COMMIT_OR_PR_TITLE"
+		message = "COMMIT_MESSAGES"
+	case squashMsgPRTitle:
+		title = "PR_TITLE"
+		message = "BLANK"
+	case squashMsgPRTitleCommits:
+		title = "PR_TITLE"
+		message = "COMMIT_MESSAGES"
+	case squashMsgPRTitleDescription:
+		title = "PR_TITLE"
+		message = "PR_BODY"
+	default:
+		return
+	}
+	edits.SquashMergeCommitTitle = &title
+	edits.SquashMergeCommitMessage = &message
 }

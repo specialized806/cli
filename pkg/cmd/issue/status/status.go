@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	issueShared "github.com/cli/cli/v2/pkg/cmd/issue/shared"
 	prShared "github.com/cli/cli/v2/pkg/cmd/pr/shared"
@@ -17,7 +17,7 @@ import (
 
 type StatusOptions struct {
 	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
+	Config     func() (gh.Config, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
 
@@ -96,7 +96,7 @@ func statusRun(opts *StatusOptions) error {
 	defer opts.IO.StopPager()
 
 	if opts.Exporter != nil {
-		data := map[string]interface{}{
+		data := map[string]any{
 			"createdBy": issuePayload.Authored.Issues,
 			"assigned":  issuePayload.Assigned.Issues,
 			"mentioned": issuePayload.Mentioned.Issues,

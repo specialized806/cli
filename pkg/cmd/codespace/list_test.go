@@ -35,6 +35,11 @@ func TestListCmdFlagError(t *testing.T) {
 			args:     "--limit -1",
 			wantsErr: fmt.Errorf("invalid limit: -1"),
 		},
+		{
+			name:     "list codespaces, --repo not in owner/repo format",
+			args:     "--repo foo",
+			wantsErr: fmt.Errorf(`invalid value for --repo: expected the "OWNER/REPO" format, got "foo"`),
+		},
 	}
 
 	for _, tt := range tests {
@@ -85,6 +90,7 @@ func TestApp_List(t *testing.T) {
 						return []*api.Codespace{
 							{
 								DisplayName: "CS1",
+								CreatedAt:   "2023-01-01T00:00:00Z",
 							},
 						}, nil
 					},
@@ -106,6 +112,7 @@ func TestApp_List(t *testing.T) {
 						return []*api.Codespace{
 							{
 								DisplayName: "CS1",
+								CreatedAt:   "2023-01-01T00:00:00Z",
 							},
 						}, nil
 					},
@@ -129,6 +136,7 @@ func TestApp_List(t *testing.T) {
 						return []*api.Codespace{
 							{
 								DisplayName: "CS1",
+								CreatedAt:   "2023-01-01T00:00:00Z",
 							},
 						}, nil
 					},
@@ -159,6 +167,7 @@ func TestApp_List(t *testing.T) {
 						return []*api.Codespace{
 							{
 								DisplayName: "CS1",
+								CreatedAt:   "2023-01-01T00:00:00Z",
 							},
 						}, nil
 					},
@@ -170,10 +179,31 @@ func TestApp_List(t *testing.T) {
 		},
 		{
 			name: "list codespaces,--web",
+			fields: fields{
+				apiClient: &apiClientMock{
+					ServerURLFunc: func() string {
+						return "https://github.com"
+					},
+				},
+			},
 			opts: &listOptions{
 				useWeb: true,
 			},
 			wantURL: "https://github.com/codespaces",
+		},
+		{
+			name: "list codespaces,--web with custom server url",
+			fields: fields{
+				apiClient: &apiClientMock{
+					ServerURLFunc: func() string {
+						return "https://github.mycompany.com"
+					},
+				},
+			},
+			opts: &listOptions{
+				useWeb: true,
+			},
+			wantURL: "https://github.mycompany.com/codespaces",
 		},
 		{
 			name: "list codespaces,--web, --repo flag",
@@ -198,6 +228,9 @@ func TestApp_List(t *testing.T) {
 								Repository:  api.Repository{ID: 123},
 							},
 						}, nil
+					},
+					ServerURLFunc: func() string {
+						return "https://github.com"
 					},
 				},
 			},

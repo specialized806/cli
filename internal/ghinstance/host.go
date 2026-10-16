@@ -4,40 +4,33 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	ghauth "github.com/cli/go-gh/v2/pkg/auth"
 )
 
+// DefaultHostname is the domain name of the default GitHub instance.
 const defaultHostname = "github.com"
 
-// localhost is the domain name of a local GitHub instance
+// Localhost is the domain name of a local GitHub instance.
 const localhost = "github.localhost"
 
-// Default returns the host name of the default GitHub instance
+// TenancyHost is the domain name of a tenancy GitHub instance.
+const tenancyHost = "ghe.com"
+
+// Default returns the host name of the default GitHub instance.
 func Default() string {
 	return defaultHostname
 }
 
-// IsEnterprise reports whether a non-normalized host name looks like a GHE instance
-func IsEnterprise(h string) bool {
-	normalizedHostName := NormalizeHostname(h)
-	return normalizedHostName != defaultHostname && normalizedHostName != localhost
+// TenantName extracts the tenant name from tenancy host name and
+// reports whether it found the tenant name.
+func TenantName(h string) (string, bool) {
+	normalizedHostName := ghauth.NormalizeHostname(h)
+	return strings.CutSuffix(normalizedHostName, "."+tenancyHost)
 }
 
 func isGarage(h string) bool {
 	return strings.EqualFold(h, "garage.github.com")
-}
-
-// NormalizeHostname returns the canonical host name of a GitHub instance
-func NormalizeHostname(h string) string {
-	hostname := strings.ToLower(h)
-	if strings.HasSuffix(hostname, "."+defaultHostname) {
-		return defaultHostname
-	}
-
-	if strings.HasSuffix(hostname, "."+localhost) {
-		return localhost
-	}
-
-	return hostname
 }
 
 func HostnameValidator(hostname string) error {
@@ -54,7 +47,7 @@ func GraphQLEndpoint(hostname string) string {
 	if isGarage(hostname) {
 		return fmt.Sprintf("https://%s/api/graphql", hostname)
 	}
-	if IsEnterprise(hostname) {
+	if ghauth.IsEnterprise(hostname) {
 		return fmt.Sprintf("https://%s/api/graphql", hostname)
 	}
 	if strings.EqualFold(hostname, localhost) {
@@ -67,7 +60,7 @@ func RESTPrefix(hostname string) string {
 	if isGarage(hostname) {
 		return fmt.Sprintf("https://%s/api/v3/", hostname)
 	}
-	if IsEnterprise(hostname) {
+	if ghauth.IsEnterprise(hostname) {
 		return fmt.Sprintf("https://%s/api/v3/", hostname)
 	}
 	if strings.EqualFold(hostname, localhost) {
@@ -78,11 +71,9 @@ func RESTPrefix(hostname string) string {
 
 func GistPrefix(hostname string) string {
 	prefix := "https://"
-
 	if strings.EqualFold(hostname, localhost) {
 		prefix = "http://"
 	}
-
 	return prefix + GistHost(hostname)
 }
 
@@ -90,7 +81,7 @@ func GistHost(hostname string) string {
 	if isGarage(hostname) {
 		return fmt.Sprintf("%s/gist/", hostname)
 	}
-	if IsEnterprise(hostname) {
+	if ghauth.IsEnterprise(hostname) {
 		return fmt.Sprintf("%s/gist/", hostname)
 	}
 	if strings.EqualFold(hostname, localhost) {
@@ -99,9 +90,34 @@ func GistHost(hostname string) string {
 	return fmt.Sprintf("gist.%s/", hostname)
 }
 
+// UserAssetUploadPrefix returns the URL prefix for user asset uploads.
+// GHES does not support this endpoint.
+func UserAssetUploadPrefix(hostname string) string {
+	if strings.EqualFold(hostname, localhost) {
+		return fmt.Sprintf("http://uploads.%s/", hostname)
+	}
+	return fmt.Sprintf("https://uploads.%s/", hostname)
+}
+
 func HostPrefix(hostname string) string {
 	if strings.EqualFold(hostname, localhost) {
 		return fmt.Sprintf("http://%s/", hostname)
 	}
 	return fmt.Sprintf("https://%s/", hostname)
+}
+
+func CategorizeHost(host string) string {
+	if host == defaultHostname {
+		return "github.com"
+	}
+
+	if ghauth.IsEnterprise(host) {
+		return "ghes"
+	}
+
+	if ghauth.IsTenancy(host) {
+		return "tenancy"
+	}
+
+	return "uncategorized"
 }

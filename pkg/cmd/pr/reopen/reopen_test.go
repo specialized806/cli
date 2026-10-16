@@ -53,7 +53,7 @@ func TestPRReopen(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
 
-	shared.RunCommandFinder("123", &api.PullRequest{
+	shared.StubFinderForRunCommandStyleTests(t, "123", &api.PullRequest{
 		ID:     "THE-ID",
 		Number: 123,
 		State:  "CLOSED",
@@ -63,7 +63,7 @@ func TestPRReopen(t *testing.T) {
 	http.Register(
 		httpmock.GraphQL(`mutation PullRequestReopen\b`),
 		httpmock.GraphQLMutation(`{"id": "THE-ID"}`,
-			func(inputs map[string]interface{}) {
+			func(inputs map[string]any) {
 				assert.Equal(t, inputs["pullRequestId"], "THE-ID")
 			}),
 	)
@@ -71,14 +71,14 @@ func TestPRReopen(t *testing.T) {
 	output, err := runCommand(http, true, "123")
 	assert.NoError(t, err)
 	assert.Equal(t, "", output.String())
-	assert.Equal(t, "✓ Reopened pull request #123 (The title of the PR)\n", output.Stderr())
+	assert.Equal(t, "✓ Reopened pull request OWNER/REPO#123 (The title of the PR)\n", output.Stderr())
 }
 
 func TestPRReopen_alreadyOpen(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
 
-	shared.RunCommandFinder("123", &api.PullRequest{
+	shared.StubFinderForRunCommandStyleTests(t, "123", &api.PullRequest{
 		ID:     "THE-ID",
 		Number: 123,
 		State:  "OPEN",
@@ -88,14 +88,14 @@ func TestPRReopen_alreadyOpen(t *testing.T) {
 	output, err := runCommand(http, true, "123")
 	assert.NoError(t, err)
 	assert.Equal(t, "", output.String())
-	assert.Equal(t, "! Pull request #123 (The title of the PR) is already open\n", output.Stderr())
+	assert.Equal(t, "! Pull request OWNER/REPO#123 (The title of the PR) is already open\n", output.Stderr())
 }
 
 func TestPRReopen_alreadyMerged(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
 
-	shared.RunCommandFinder("123", &api.PullRequest{
+	shared.StubFinderForRunCommandStyleTests(t, "123", &api.PullRequest{
 		ID:     "THE-ID",
 		Number: 123,
 		State:  "MERGED",
@@ -105,14 +105,14 @@ func TestPRReopen_alreadyMerged(t *testing.T) {
 	output, err := runCommand(http, true, "123")
 	assert.EqualError(t, err, "SilentError")
 	assert.Equal(t, "", output.String())
-	assert.Equal(t, "X Pull request #123 (The title of the PR) can't be reopened because it was already merged\n", output.Stderr())
+	assert.Equal(t, "X Pull request OWNER/REPO#123 (The title of the PR) can't be reopened because it was already merged\n", output.Stderr())
 }
 
 func TestPRReopen_withComment(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
 
-	shared.RunCommandFinder("123", &api.PullRequest{
+	shared.StubFinderForRunCommandStyleTests(t, "123", &api.PullRequest{
 		ID:     "THE-ID",
 		Number: 123,
 		State:  "CLOSED",
@@ -125,7 +125,7 @@ func TestPRReopen_withComment(t *testing.T) {
 		{ "data": { "addComment": { "commentEdge": { "node": {
 			"url": "https://github.com/OWNER/REPO/issues/123#issuecomment-456"
 		} } } } }`,
-			func(inputs map[string]interface{}) {
+			func(inputs map[string]any) {
 				assert.Equal(t, "THE-ID", inputs["subjectId"])
 				assert.Equal(t, "reopening comment", inputs["body"])
 			}),
@@ -133,7 +133,7 @@ func TestPRReopen_withComment(t *testing.T) {
 	http.Register(
 		httpmock.GraphQL(`mutation PullRequestReopen\b`),
 		httpmock.GraphQLMutation(`{"id": "THE-ID"}`,
-			func(inputs map[string]interface{}) {
+			func(inputs map[string]any) {
 				assert.Equal(t, inputs["pullRequestId"], "THE-ID")
 			}),
 	)
@@ -141,5 +141,5 @@ func TestPRReopen_withComment(t *testing.T) {
 	output, err := runCommand(http, true, "123 --comment 'reopening comment'")
 	assert.NoError(t, err)
 	assert.Equal(t, "", output.String())
-	assert.Equal(t, "✓ Reopened pull request #123 (The title of the PR)\n", output.Stderr())
+	assert.Equal(t, "✓ Reopened pull request OWNER/REPO#123 (The title of the PR)\n", output.Stderr())
 }

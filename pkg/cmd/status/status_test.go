@@ -10,6 +10,7 @@ import (
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/httpmock"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -59,8 +60,8 @@ func TestNewCmdStatus(t *testing.T) {
 
 		f := &cmdutil.Factory{
 			IOStreams: ios,
-			Config: func() (config.Config, error) {
-				return config.NewBlankConfig(), nil
+			Config: func() (gh.Config, error) {
+				return config.NewMockConfig(), nil
 			},
 		}
 		t.Run(tt.name, func(t *testing.T) {
@@ -103,6 +104,25 @@ func TestStatusRun(t *testing.T) {
 				reg.Register(
 					httpmock.REST("GET", "notifications"),
 					httpmock.StringResponse(`[]`))
+				reg.Register(
+					httpmock.REST("GET", "users/jillvalentine/received_events"),
+					httpmock.StringResponse(`[]`))
+			},
+			opts:    &StatusOptions{},
+			wantOut: "Assigned Issues                       │ Assigned Pull Requests                \nNothing here ^_^                      │ Nothing here ^_^                      \n                                      │                                       \nReview Requests                       │ Mentions                              \nNothing here ^_^                      │ Nothing here ^_^                      \n                                      │                                       \nRepository Activity\nNothing here ^_^\n\n",
+		},
+		{
+			name: "notifications 404 is tolerated",
+			httpStubs: func(reg *httpmock.Registry) {
+				reg.Register(
+					httpmock.GraphQL("UserCurrent"),
+					httpmock.StringResponse(`{"data": {"viewer": {"login": "jillvalentine"}}}`))
+				reg.Register(
+					httpmock.GraphQL("AssignedSearch"),
+					httpmock.StringResponse(`{"data": { "assignments": {"nodes": [] }, "reviewRequested": {"nodes": []}}}`))
+				reg.Register(
+					httpmock.REST("GET", "notifications"),
+					httpmock.StatusStringResponse(http.StatusNotFound, `{"message":"Not Found"}`))
 				reg.Register(
 					httpmock.REST("GET", "users/jillvalentine/received_events"),
 					httpmock.StringResponse(`[]`))
@@ -293,6 +313,63 @@ func TestStatusRun(t *testing.T) {
 				
 				warning: Resource protected by organization SAML enforcement. You must grant your OAuth token access to this organization.
 				warning: You don't have permission to access this resource.
+			`),
+		},
+		{
+			name: "not found errors",
+			httpStubs: func(reg *httpmock.Registry) {
+				reg.Register(
+					httpmock.GraphQL("UserCurrent"),
+					httpmock.StringResponse(`{"data": {"viewer": {"login": "jillvalentine"}}}`))
+				reg.Register(
+					httpmock.REST("GET", "repos/rpd/todo/issues/110"),
+					httpmock.StringResponse(`{"body":"hello @jillvalentine how are you"}`))
+				reg.Register(
+					httpmock.REST("GET", "repos/rpd/todo/issues/4113"),
+					httpmock.StringResponse(`{"body":"this is a comment"}`))
+				reg.Register(
+					httpmock.REST("GET", "repos/cli/cli/issues/1096"),
+					httpmock.StringResponse(`{"body":"@jillvalentine hi"}`))
+				reg.Register(
+					httpmock.REST("GET", "repos/rpd/todo/issues/comments/1065"),
+					httpmock.StatusStringResponse(404, `{
+						"message": "Not Found."
+					}`))
+				reg.Register(
+					httpmock.REST("GET", "repos/vilmibm/gh-screensaver/issues/comments/10"),
+					httpmock.StringResponse(`{"body":"a message for @jillvalentine"}`))
+				reg.Register(
+					httpmock.GraphQL("AssignedSearch"),
+					httpmock.FileResponse("./fixtures/search.json"))
+				reg.Register(
+					httpmock.REST("GET", "notifications"),
+					httpmock.FileResponse("./fixtures/notifications.json"))
+				reg.Register(
+					httpmock.REST("GET", "users/jillvalentine/received_events"),
+					httpmock.FileResponse("./fixtures/events.json"))
+			},
+			opts: &StatusOptions{},
+			wantOut: heredoc.Doc(`
+				Assigned Issues                       │ Assigned Pull Requests                
+				vilmibm/testing#157     yolo          │ cli/cli#5272  Pin extensions          
+				cli/cli#3223            Repo garden...│ rpd/todo#73   Board up RPD windows    
+				rpd/todo#514            Reducing zo...│ cli/cli#4768  Issue Frecency          
+				vilmibm/testing#74      welp          │                                       
+				adreyer/arkestrator#22  complete mo...│                                       
+				                                      │                                       
+				Review Requests                       │ Mentions                              
+				cli/cli#5272          Pin extensions  │ rpd/todo#110               hello @j...
+				vilmibm/testing#1234  Foobar          │ cli/cli#1096               @jillval...
+				rpd/todo#50           Welcome party...│ vilmibm/gh-screensaver#15  a messag...
+				cli/cli#4671          This pull req...│                                       
+				rpd/todo#49           Haircut for Leon│                                       
+				                                      │                                       
+				Repository Activity
+				rpd/todo#5326         new PR                        Only write UTF-8 BOM on W...
+				vilmibm/testing#5325  comment on Ability to sea...  We are working on dedicat...
+				cli/cli#5319          comment on [Codespaces] D...  Wondering if we shouldn't...
+				cli/cli#5300          new issue                     Terminal bell when a runn...
+				
 			`),
 		},
 		{

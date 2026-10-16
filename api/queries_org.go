@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/shurcooL/githubv4"
 )
@@ -19,7 +20,7 @@ func OrganizationProjects(client *Client, repo ghrepo.Interface) ([]RepoProject,
 		} `graphql:"organization(login: $owner)"`
 	}
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner":     githubv4.String(repo.RepoOwner()),
 		"endCursor": (*githubv4.String)(nil),
 	}
@@ -47,6 +48,31 @@ type OrgTeam struct {
 	Slug string
 }
 
+// OrganizationTeam fetch the team in an organization with the given slug
+func OrganizationTeam(client *Client, hostname string, org string, teamSlug string) (*OrgTeam, error) {
+	type responseData struct {
+		Organization struct {
+			Team OrgTeam `graphql:"team(slug: $teamSlug)"`
+		} `graphql:"organization(login: $owner)"`
+	}
+
+	variables := map[string]any{
+		"owner":    githubv4.String(org),
+		"teamSlug": githubv4.String(teamSlug),
+	}
+
+	var query responseData
+	err := client.Query(hostname, "OrganizationTeam", &query, variables)
+	if err != nil {
+		return nil, err
+	}
+	if query.Organization.Team.ID == "" {
+		return nil, fmt.Errorf("could not resolve to a Team with the slug of '%s'", teamSlug)
+	}
+
+	return &query.Organization.Team, nil
+}
+
 // OrganizationTeams fetches all the teams in an organization
 func OrganizationTeams(client *Client, repo ghrepo.Interface) ([]OrgTeam, error) {
 	type responseData struct {
@@ -61,7 +87,7 @@ func OrganizationTeams(client *Client, repo ghrepo.Interface) ([]OrgTeam, error)
 		} `graphql:"organization(login: $owner)"`
 	}
 
-	variables := map[string]interface{}{
+	variables := map[string]any{
 		"owner":     githubv4.String(repo.RepoOwner()),
 		"endCursor": (*githubv4.String)(nil),
 	}

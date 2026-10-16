@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 
+	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/safeurl"
 	"github.com/cli/cli/v2/pkg/cmd/run/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -20,6 +23,7 @@ type RerunOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
+	Prompter   shared.Prompter
 
 	RunID      string
 	OnlyFailed bool
@@ -32,13 +36,28 @@ type RerunOptions struct {
 func NewCmdRerun(f *cmdutil.Factory, runF func(*RerunOptions) error) *cobra.Command {
 	opts := &RerunOptions{
 		IO:         f.IOStreams,
+		Prompter:   f.Prompter,
 		HttpClient: f.HttpClient,
 	}
 
 	cmd := &cobra.Command{
 		Use:   "rerun [<run-id>]",
-		Short: "Rerun a failed run",
-		Args:  cobra.MaximumNArgs(1),
+		Short: "Rerun a run",
+		Long: heredoc.Docf(`
+			Rerun an entire run, only failed jobs, or a specific job from a run.
+
+			Note that due to historical reasons, the %[1]s--job%[1]s flag may not take what you expect.
+			Specifically, when navigating to a job in the browser, the URL looks like this:
+			%[1]shttps://github.com/<owner>/<repo>/actions/runs/<run-id>/jobs/<number>%[1]s.
+
+			However, this %[1]s<number>%[1]s should not be used with the %[1]s--job%[1]s flag and will result in the
+			API returning %[1]s404 NOT FOUND%[1]s. Instead, you can get the correct job IDs using the following command:
+
+				gh run view <run-id> --json jobs --jq '.jobs[] | {name, databaseId}'
+
+			You will need to use databaseId field for triggering job re-runs.
+		`, "`"),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// support `-R, --repo` override
 			opts.BaseRepo = f.BaseRepo
@@ -54,7 +73,11 @@ func NewCmdRerun(f *cmdutil.Factory, runF func(*RerunOptions) error) *cobra.Comm
 			}
 
 			if opts.RunID != "" && opts.JobID != "" {
-				return cmdutil.FlagErrorf("specify only one of `<run-id>` or `--job`")
+				opts.RunID = ""
+				if opts.IO.CanPrompt() {
+					cs := opts.IO.ColorScheme()
+					fmt.Fprintf(opts.IO.ErrOut, "%s both run and job IDs specified; ignoring run ID\n", cs.WarningIcon())
+				}
 			}
 
 			if runF != nil {
@@ -65,7 +88,7 @@ func NewCmdRerun(f *cmdutil.Factory, runF func(*RerunOptions) error) *cobra.Comm
 	}
 
 	cmd.Flags().BoolVar(&opts.OnlyFailed, "failed", false, "Rerun only failed jobs, including dependencies")
-	cmd.Flags().StringVarP(&opts.JobID, "job", "j", "", "Rerun a specific job from a run, including dependencies")
+	cmd.Flags().StringVarP(&opts.JobID, "job", "j", "", "Rerun a specific job ID from a run, including dependencies")
 	cmd.Flags().BoolVarP(&opts.Debug, "debug", "d", false, "Rerun with debug logging")
 
 	return cmd
@@ -114,8 +137,7 @@ func runRerun(opts *RerunOptions) error {
 		if len(runs) == 0 {
 			return errors.New("no recent runs have failed; please specify a specific `<run-id>`")
 		}
-		runID, err = shared.PromptForRun(cs, runs)
-		if err != nil {
+		if runID, err = shared.SelectRun(opts.Prompter, cs, runs); err != nil {
 			return err
 		}
 	}
@@ -176,13 +198,16 @@ func rerunRun(client *api.Client, repo ghrepo.Interface, run *shared.Run, onlyFa
 		return fmt.Errorf("failed to create rerun body: %w", err)
 	}
 
-	path := fmt.Sprintf("repos/%s/actions/runs/%d/%s", ghrepo.FullName(repo), run.ID, runVerb)
+	path, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "runs", strconv.FormatInt(run.ID, 10), runVerb)
+	if err != nil {
+		return err
+	}
 
-	err = client.REST(repo.RepoHost(), "POST", path, body, nil)
+	err = client.REST(repo.RepoHost(), "POST", path.String(), body, nil)
 	if err != nil {
 		var httpError api.HTTPError
 		if errors.As(err, &httpError) && httpError.StatusCode == 403 {
-			return fmt.Errorf("run %d cannot be rerun; its workflow file may be broken", run.ID)
+			return fmt.Errorf("run %d cannot be rerun; %s", run.ID, httpError.Message)
 		}
 		return fmt.Errorf("failed to rerun: %w", err)
 	}
@@ -195,9 +220,12 @@ func rerunJob(client *api.Client, repo ghrepo.Interface, job *shared.Job, debug 
 		return fmt.Errorf("failed to create rerun body: %w", err)
 	}
 
-	path := fmt.Sprintf("repos/%s/actions/jobs/%d/rerun", ghrepo.FullName(repo), job.ID)
+	path, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "jobs", strconv.FormatInt(job.ID, 10), "rerun")
+	if err != nil {
+		return err
+	}
 
-	err = client.REST(repo.RepoHost(), "POST", path, body, nil)
+	err = client.REST(repo.RepoHost(), "POST", path.String(), body, nil)
 	if err != nil {
 		var httpError api.HTTPError
 		if errors.As(err, &httpError) && httpError.StatusCode == 403 {

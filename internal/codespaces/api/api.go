@@ -1,13 +1,12 @@
 package api
 
 // For descriptions of service interfaces, see:
-// - https://online.visualstudio.com/api/swagger (for visualstudio.com)
 // - https://docs.github.com/en/rest/reference/repos (for api.github.com)
 // - https://github.com/github/github/blob/master/app/api/codespaces.rb (for vscs_internal)
 // TODO(adonovan): replace the last link with a public doc URL when available.
 
 // TODO(adonovan): a possible reorganization would be to split this
-// file into three internal packages, one per backend service, and to
+// file into two internal packages, one per backend service, and to
 // rename api.API to github.Client:
 //
 // - github.GetUser(github.Client)
@@ -20,7 +19,6 @@ package api
 // - codespaces.GetToken(Client, login, name)
 // - codespaces.List(Client, user)
 // - codespaces.Start(Client, token, codespace)
-// - visualstudio.GetRegionLocation(http.Client) // no dependency on github
 //
 // This would make the meaning of each operation clearer.
 
@@ -34,6 +32,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -42,13 +41,15 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/safeurl"
+	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/opentracing/opentracing-go"
 )
 
 const (
-	githubServer = "https://github.com"
-	githubAPI    = "https://api.github.com"
-	vscsAPI      = "https://online.visualstudio.com"
+	defaultAPIURL    = "https://api.github.com"
+	defaultServerURL = "https://github.com"
 )
 
 const (
@@ -60,34 +61,45 @@ const (
 
 // API is the interface to the codespace service.
 type API struct {
-	client       httpClient
-	vscsAPI      string
-	githubAPI    string
-	githubServer string
-	retryBackoff time.Duration
-}
-
-type httpClient interface {
-	Do(req *http.Request) (*http.Response, error)
+	client         func() (*http.Client, error)
+	externalClient func() (*http.Client, error)
+	githubAPI      string
+	githubServer   string
+	retryBackoff   time.Duration
 }
 
 // New creates a new API client connecting to the configured endpoints with the HTTP client.
-func New(serverURL, apiURL, vscsURL string, httpClient httpClient) *API {
-	if serverURL == "" {
-		serverURL = githubServer
-	}
+func New(f *cmdutil.Factory) *API {
+	apiURL := os.Getenv("GITHUB_API_URL")
 	if apiURL == "" {
-		apiURL = githubAPI
+		cfg, err := f.Config()
+		if err != nil {
+			// fallback to the default api endpoint
+			apiURL = defaultAPIURL
+		} else {
+			host, _ := cfg.Authentication().DefaultHost()
+			apiURL = ghinstance.RESTPrefix(host)
+		}
 	}
-	if vscsURL == "" {
-		vscsURL = vscsAPI
+
+	serverURL := os.Getenv("GITHUB_SERVER_URL")
+	if serverURL == "" {
+		cfg, err := f.Config()
+		if err != nil {
+			// fallback to the default server endpoint
+			serverURL = defaultServerURL
+		} else {
+			host, _ := cfg.Authentication().DefaultHost()
+			serverURL = ghinstance.HostPrefix(host)
+		}
 	}
+
 	return &API{
-		client:       httpClient,
-		vscsAPI:      strings.TrimSuffix(vscsURL, "/"),
-		githubAPI:    strings.TrimSuffix(apiURL, "/"),
-		githubServer: strings.TrimSuffix(serverURL, "/"),
-		retryBackoff: 100 * time.Millisecond,
+		client:         f.HttpClient,
+		externalClient: f.ExternalHttpClient,
+		githubAPI:      strings.TrimSuffix(apiURL, "/"),
+		githubServer:   strings.TrimSuffix(serverURL, "/"),
+		retryBackoff:   100 * time.Millisecond,
 	}
 }
 
@@ -97,9 +109,18 @@ type User struct {
 	Type  string `json:"type"`
 }
 
+// ServerURL returns the server url (not the API url), such as https://github.com
+func (a *API) ServerURL() string {
+	return a.githubServer
+}
+
 // GetUser returns the user associated with the given token.
 func (a *API) GetUser(ctx context.Context) (*User, error) {
-	req, err := http.NewRequest(http.MethodGet, a.githubAPI+"/user", nil)
+	u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "user")
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -122,22 +143,37 @@ func (a *API) GetUser(ctx context.Context) (*User, error) {
 
 	var response User
 	if err := json.Unmarshal(b, &response); err != nil {
-		return nil, fmt.Errorf("error unmarshaling response: %w", err)
+		return nil, fmt.Errorf("error unmarshalling response: %w", err)
 	}
 
 	return &response, nil
 }
 
+// RepositoryOwner represents owner of a repository
+type RepositoryOwner struct {
+	Type  string `json:"type"`
+	Login string `json:"login"`
+}
+
 // Repository represents a GitHub repository.
 type Repository struct {
-	ID            int    `json:"id"`
-	FullName      string `json:"full_name"`
-	DefaultBranch string `json:"default_branch"`
+	ID            int64           `json:"id"`
+	FullName      string          `json:"full_name"`
+	DefaultBranch string          `json:"default_branch"`
+	Owner         RepositoryOwner `json:"owner"`
 }
 
 // GetRepository returns the repository associated with the given owner and name.
 func (a *API) GetRepository(ctx context.Context, nwo string) (*Repository, error) {
-	req, err := http.NewRequest(http.MethodGet, a.githubAPI+"/repos/"+strings.ToLower(nwo), nil)
+	owner, name, err := safeurl.RepoPartsFromNWO(strings.ToLower(nwo))
+	if err != nil {
+		return nil, err
+	}
+	u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "repos", owner, name)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -160,7 +196,7 @@ func (a *API) GetRepository(ctx context.Context, nwo string) (*Repository, error
 
 	var response Repository
 	if err := json.Unmarshal(b, &response); err != nil {
-		return nil, fmt.Errorf("error unmarshaling response: %w", err)
+		return nil, fmt.Errorf("error unmarshalling response: %w", err)
 	}
 
 	return &response, nil
@@ -180,11 +216,21 @@ type Codespace struct {
 	GitStatus                      CodespaceGitStatus  `json:"git_status"`
 	Connection                     CodespaceConnection `json:"connection"`
 	Machine                        CodespaceMachine    `json:"machine"`
+	RuntimeConstraints             RuntimeConstraints  `json:"runtime_constraints"`
 	VSCSTarget                     string              `json:"vscs_target"`
 	PendingOperation               bool                `json:"pending_operation"`
 	PendingOperationDisabledReason string              `json:"pending_operation_disabled_reason"`
 	IdleTimeoutNotice              string              `json:"idle_timeout_notice"`
 	WebURL                         string              `json:"web_url"`
+	DevContainerPath               string              `json:"devcontainer_path"`
+	Prebuild                       bool                `json:"prebuild"`
+	Location                       string              `json:"location"`
+	IdleTimeoutMinutes             int                 `json:"idle_timeout_minutes"`
+	RetentionPeriodMinutes         int                 `json:"retention_period_minutes"`
+	RetentionExpiresAt             string              `json:"retention_expires_at"`
+	RecentFolders                  []string            `json:"recent_folders"`
+	BillableOwner                  User                `json:"billable_owner"`
+	EnvironmentId                  string              `json:"environment_id"`
 }
 
 type CodespaceGitStatus struct {
@@ -209,6 +255,8 @@ const (
 	CodespaceStateAvailable = "Available"
 	// CodespaceStateShutdown is the state for a shutdown codespace environment.
 	CodespaceStateShutdown = "Shutdown"
+	// CodespaceStateShuttingDown is the state for a shutting down codespace environment.
+	CodespaceStateShuttingDown = "ShuttingDown"
 	// CodespaceStateStarting is the state for a starting codespace environment.
 	CodespaceStateStarting = "Starting"
 	// CodespaceStateRebuilding is the state for a rebuilding codespace environment.
@@ -216,15 +264,24 @@ const (
 )
 
 type CodespaceConnection struct {
-	SessionID      string   `json:"sessionId"`
-	SessionToken   string   `json:"sessionToken"`
-	RelayEndpoint  string   `json:"relayEndpoint"`
-	RelaySAS       string   `json:"relaySas"`
-	HostPublicKeys []string `json:"hostPublicKeys"`
+	TunnelProperties TunnelProperties `json:"tunnelProperties"`
 }
 
-// CodespaceFields is the list of exportable fields for a codespace.
-var CodespaceFields = []string{
+type TunnelProperties struct {
+	ConnectAccessToken     string `json:"connectAccessToken"`
+	ManagePortsAccessToken string `json:"managePortsAccessToken"`
+	ServiceUri             string `json:"serviceUri"`
+	TunnelId               string `json:"tunnelId"`
+	ClusterId              string `json:"clusterId"`
+	Domain                 string `json:"domain"`
+}
+
+type RuntimeConstraints struct {
+	AllowedPortPrivacySettings []string `json:"allowed_port_privacy_settings"`
+}
+
+// ListCodespaceFields is the list of exportable fields for a codespace when using the `gh cs list` command.
+var ListCodespaceFields = []string{
 	"displayName",
 	"name",
 	"owner",
@@ -237,9 +294,33 @@ var CodespaceFields = []string{
 	"vscsTarget",
 }
 
-func (c *Codespace) ExportData(fields []string) map[string]interface{} {
+// ViewCodespaceFields is the list of exportable fields for a codespace when using the `gh cs view` command.
+var ViewCodespaceFields = []string{
+	"name",
+	"displayName",
+	"state",
+	"owner",
+	"billableOwner",
+	"location",
+	"repository",
+	"gitStatus",
+	"devcontainerPath",
+	"machineName",
+	"machineDisplayName",
+	"prebuild",
+	"createdAt",
+	"lastUsedAt",
+	"idleTimeoutMinutes",
+	"retentionPeriodDays",
+	"retentionExpiresAt",
+	"recentFolders",
+	"vscsTarget",
+	"environmentId",
+}
+
+func (c *Codespace) ExportData(fields []string) map[string]any {
 	v := reflect.ValueOf(c).Elem()
-	data := map[string]interface{}{}
+	data := map[string]any{}
 
 	for _, f := range fields {
 		switch f {
@@ -249,11 +330,17 @@ func (c *Codespace) ExportData(fields []string) map[string]interface{} {
 			data[f] = c.Repository.FullName
 		case "machineName":
 			data[f] = c.Machine.Name
+		case "machineDisplayName":
+			data[f] = c.Machine.DisplayName
+		case "retentionPeriodDays":
+			data[f] = c.RetentionPeriodMinutes / 1440
 		case "gitStatus":
-			data[f] = map[string]interface{}{
+			data[f] = map[string]any{
 				"ref":                   c.GitStatus.Ref,
 				"hasUnpushedChanges":    c.GitStatus.HasUnpushedChanges,
 				"hasUncommittedChanges": c.GitStatus.HasUncommittedChanges,
+				"ahead":                 c.GitStatus.Ahead,
+				"behind":                c.GitStatus.Behind,
 			}
 		case "vscsTarget":
 			if c.VSCSTarget != "" && c.VSCSTarget != VSCSTargetProduction {
@@ -290,31 +377,55 @@ func (a *API) ListCodespaces(ctx context.Context, opts ListCodespacesOptions) (c
 	}
 
 	var (
-		listURL  string
+		listURL  safeurl.SafeURL
 		spanName string
 	)
 
 	if opts.RepoName != "" {
-		listURL = fmt.Sprintf("%s/repos/%s/codespaces?per_page=%d", a.githubAPI, opts.RepoName, perPage)
+		owner, name, err := safeurl.RepoPartsFromNWO(opts.RepoName)
+		if err != nil {
+			return nil, err
+		}
+		u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "repos", owner, name, "codespaces")
+		if err != nil {
+			return nil, err
+		}
+		u.SetQuery("per_page", strconv.Itoa(perPage))
+		listURL = u
 		spanName = "/repos/*/codespaces"
 	} else if opts.OrgName != "" {
 		// the endpoints below can only be called by the organization admins
 		orgName := opts.OrgName
 		if opts.UserName != "" {
 			userName := opts.UserName
-			listURL = fmt.Sprintf("%s/orgs/%s/members/%s/codespaces?per_page=%d", a.githubAPI, orgName, userName, perPage)
+			u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "orgs", orgName, "members", userName, "codespaces")
+			if err != nil {
+				return nil, err
+			}
+			u.SetQuery("per_page", strconv.Itoa(perPage))
+			listURL = u
 			spanName = "/orgs/*/members/*/codespaces"
 		} else {
-			listURL = fmt.Sprintf("%s/orgs/%s/codespaces?per_page=%d", a.githubAPI, orgName, perPage)
+			u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "orgs", orgName, "codespaces")
+			if err != nil {
+				return nil, err
+			}
+			u.SetQuery("per_page", strconv.Itoa(perPage))
+			listURL = u
 			spanName = "/orgs/*/codespaces"
 		}
 	} else {
-		listURL = fmt.Sprintf("%s/user/codespaces?per_page=%d", a.githubAPI, perPage)
+		u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "user", "codespaces")
+		if err != nil {
+			return nil, err
+		}
+		u.SetQuery("per_page", strconv.Itoa(perPage))
+		listURL = u
 		spanName = "/user/codespaces"
 	}
 
 	for {
-		req, err := http.NewRequest(http.MethodGet, listURL, nil)
+		req, err := http.NewRequest(http.MethodGet, listURL.String(), nil)
 		if err != nil {
 			return nil, fmt.Errorf("error creating request: %w", err)
 		}
@@ -336,7 +447,7 @@ func (a *API) ListCodespaces(ctx context.Context, opts ListCodespacesOptions) (c
 
 		dec := json.NewDecoder(resp.Body)
 		if err := dec.Decode(&response); err != nil {
-			return nil, fmt.Errorf("error unmarshaling response: %w", err)
+			return nil, fmt.Errorf("error unmarshalling response: %w", err)
 		}
 
 		nextURL := findNextPage(resp.Header.Get("Link"))
@@ -351,9 +462,9 @@ func (a *API) ListCodespaces(ctx context.Context, opts ListCodespacesOptions) (c
 			q := u.Query()
 			q.Set("per_page", strconv.Itoa(newPerPage))
 			u.RawQuery = q.Encode()
-			listURL = u.String()
+			listURL = safeurl.NewImmutableSafeURL(u.String())
 		} else {
-			listURL = nextURL
+			listURL = safeurl.NewImmutableSafeURL(nextURL)
 		}
 	}
 
@@ -373,10 +484,15 @@ func findNextPage(linkValue string) string {
 
 func (a *API) GetOrgMemberCodespace(ctx context.Context, orgName string, userName string, codespaceName string) (*Codespace, error) {
 	perPage := 100
-	listURL := fmt.Sprintf("%s/orgs/%s/members/%s/codespaces?per_page=%d", a.githubAPI, orgName, userName, perPage)
+	u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "orgs", orgName, "members", userName, "codespaces")
+	if err != nil {
+		return nil, err
+	}
+	u.SetQuery("per_page", strconv.Itoa(perPage))
+	var listURL safeurl.SafeURL = u
 
 	for {
-		req, err := http.NewRequest(http.MethodGet, listURL, nil)
+		req, err := http.NewRequest(http.MethodGet, listURL.String(), nil)
 		if err != nil {
 			return nil, fmt.Errorf("error creating request: %w", err)
 		}
@@ -398,7 +514,7 @@ func (a *API) GetOrgMemberCodespace(ctx context.Context, orgName string, userNam
 
 		dec := json.NewDecoder(resp.Body)
 		if err := dec.Decode(&response); err != nil {
-			return nil, fmt.Errorf("error unmarshaling response: %w", err)
+			return nil, fmt.Errorf("error unmarshalling response: %w", err)
 		}
 
 		for _, cs := range response.Codespaces {
@@ -411,7 +527,7 @@ func (a *API) GetOrgMemberCodespace(ctx context.Context, orgName string, userNam
 		if nextURL == "" {
 			break
 		}
-		listURL = nextURL
+		listURL = safeurl.NewImmutableSafeURL(nextURL)
 	}
 
 	return nil, fmt.Errorf("codespace not found for user %s with name %s", userName, codespaceName)
@@ -422,9 +538,13 @@ func (a *API) GetOrgMemberCodespace(ctx context.Context, orgName string, userNam
 // If includeConnection is true, it will return the connection information for the codespace.
 func (a *API) GetCodespace(ctx context.Context, codespaceName string, includeConnection bool) (*Codespace, error) {
 	resp, err := a.withRetry(func() (*http.Response, error) {
+		u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "user", "codespaces", codespaceName)
+		if err != nil {
+			return nil, err
+		}
 		req, err := http.NewRequest(
 			http.MethodGet,
-			a.githubAPI+"/user/codespaces/"+codespaceName,
+			u.String(),
 			nil,
 		)
 		if err != nil {
@@ -455,7 +575,7 @@ func (a *API) GetCodespace(ctx context.Context, codespaceName string, includeCon
 
 	var response Codespace
 	if err := json.Unmarshal(b, &response); err != nil {
-		return nil, fmt.Errorf("error unmarshaling response: %w", err)
+		return nil, fmt.Errorf("error unmarshalling response: %w", err)
 	}
 
 	return &response, nil
@@ -465,9 +585,13 @@ func (a *API) GetCodespace(ctx context.Context, codespaceName string, includeCon
 // If the codespace is already running, the returned error from the API is ignored.
 func (a *API) StartCodespace(ctx context.Context, codespaceName string) error {
 	resp, err := a.withRetry(func() (*http.Response, error) {
+		u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "user", "codespaces", codespaceName, "start")
+		if err != nil {
+			return nil, err
+		}
 		req, err := http.NewRequest(
 			http.MethodPost,
-			a.githubAPI+"/user/codespaces/"+codespaceName+"/start",
+			u.String(),
 			nil,
 		)
 		if err != nil {
@@ -493,18 +617,22 @@ func (a *API) StartCodespace(ctx context.Context, codespaceName string) error {
 }
 
 func (a *API) StopCodespace(ctx context.Context, codespaceName string, orgName string, userName string) error {
-	var stopURL string
+	var stopURL *safeurl.MutableSafeURL
 	var spanName string
+	var err error
 
 	if orgName != "" {
-		stopURL = fmt.Sprintf("%s/orgs/%s/members/%s/codespaces/%s/stop", a.githubAPI, orgName, userName, codespaceName)
+		stopURL, err = safeurl.JoinPathWithHostPrefix(a.githubAPI, "orgs", orgName, "members", userName, "codespaces", codespaceName, "stop")
 		spanName = "/orgs/*/members/*/codespaces/*/stop"
 	} else {
-		stopURL = fmt.Sprintf("%s/user/codespaces/%s/stop", a.githubAPI, codespaceName)
+		stopURL, err = safeurl.JoinPathWithHostPrefix(a.githubAPI, "user", "codespaces", codespaceName, "stop")
 		spanName = "/user/codespaces/*/stop"
 	}
+	if err != nil {
+		return err
+	}
 
-	req, err := http.NewRequest(http.MethodPost, stopURL, nil)
+	req, err := http.NewRequest(http.MethodPost, stopURL.String(), nil)
 	if err != nil {
 		return fmt.Errorf("error creating request: %w", err)
 	}
@@ -530,9 +658,12 @@ type Machine struct {
 }
 
 // GetCodespacesMachines returns the codespaces machines for the given repo, branch and location.
-func (a *API) GetCodespacesMachines(ctx context.Context, repoID int, branch, location string, devcontainerPath string) ([]*Machine, error) {
-	reqURL := fmt.Sprintf("%s/repositories/%d/codespaces/machines", a.githubAPI, repoID)
-	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+func (a *API) GetCodespacesMachines(ctx context.Context, repoID int64, branch, location string, devcontainerPath string) ([]*Machine, error) {
+	u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "repositories", strconv.FormatInt(repoID, 10), "codespaces", "machines")
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -563,10 +694,52 @@ func (a *API) GetCodespacesMachines(ctx context.Context, repoID int, branch, loc
 		Machines []*Machine `json:"machines"`
 	}
 	if err := json.Unmarshal(b, &response); err != nil {
-		return nil, fmt.Errorf("error unmarshaling response: %w", err)
+		return nil, fmt.Errorf("error unmarshalling response: %w", err)
 	}
 
 	return response.Machines, nil
+}
+
+// GetCodespacesPermissionsCheck returns a bool indicating whether the user has accepted permissions for the given repo and devcontainer path.
+func (a *API) GetCodespacesPermissionsCheck(ctx context.Context, repoID int64, branch string, devcontainerPath string) (bool, error) {
+	u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "repositories", strconv.FormatInt(repoID, 10), "codespaces", "permissions_check")
+	if err != nil {
+		return false, err
+	}
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false, fmt.Errorf("error creating request: %w", err)
+	}
+
+	q := req.URL.Query()
+	q.Add("ref", branch)
+	q.Add("devcontainer_path", devcontainerPath)
+	req.URL.RawQuery = q.Encode()
+
+	a.setHeaders(req)
+	resp, err := a.do(ctx, req, "/repositories/*/codespaces/permissions_check")
+	if err != nil {
+		return false, fmt.Errorf("error making request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, api.HandleHTTPError(resp)
+	}
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("error reading response body: %w", err)
+	}
+
+	var response struct {
+		Accepted bool `json:"accepted"`
+	}
+	if err := json.Unmarshal(b, &response); err != nil {
+		return false, fmt.Errorf("error unmarshalling response: %w", err)
+	}
+
+	return response.Accepted, nil
 }
 
 // RepoSearchParameters are the optional parameters for searching for repositories.
@@ -579,8 +752,11 @@ type RepoSearchParameters struct {
 
 // GetCodespaceRepoSuggestions searches for and returns repo names based on the provided search text.
 func (a *API) GetCodespaceRepoSuggestions(ctx context.Context, partialSearch string, parameters RepoSearchParameters) ([]string, error) {
-	reqURL := fmt.Sprintf("%s/search/repositories", a.githubAPI)
-	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+	reqURL, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "search", "repositories")
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, reqURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -636,7 +812,7 @@ func (a *API) GetCodespaceRepoSuggestions(ctx context.Context, partialSearch str
 		Items []*Repository `json:"items"`
 	}
 	if err := json.Unmarshal(b, &response); err != nil {
-		return nil, fmt.Errorf("error unmarshaling response: %w", err)
+		return nil, fmt.Errorf("error unmarshalling response: %w", err)
 	}
 
 	repoNames := make([]string, len(response.Items))
@@ -650,7 +826,15 @@ func (a *API) GetCodespaceRepoSuggestions(ctx context.Context, partialSearch str
 // GetCodespaceBillableOwner returns the billable owner and expected default values for
 // codespaces created by the user for a given repository.
 func (a *API) GetCodespaceBillableOwner(ctx context.Context, nwo string) (*User, error) {
-	req, err := http.NewRequest(http.MethodGet, a.githubAPI+"/repos/"+nwo+"/codespaces/new", nil)
+	owner, name, err := safeurl.RepoPartsFromNWO(nwo)
+	if err != nil {
+		return nil, err
+	}
+	u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "repos", owner, name, "codespaces", "new")
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -683,7 +867,7 @@ func (a *API) GetCodespaceBillableOwner(ctx context.Context, nwo string) (*User,
 		}
 	}
 	if err := json.Unmarshal(b, &response); err != nil {
-		return nil, fmt.Errorf("error unmarshaling response: %w", err)
+		return nil, fmt.Errorf("error unmarshalling response: %w", err)
 	}
 
 	// While this response contains further helpful information ahead of codespace creation,
@@ -693,7 +877,7 @@ func (a *API) GetCodespaceBillableOwner(ctx context.Context, nwo string) (*User,
 
 // CreateCodespaceParams are the required parameters for provisioning a Codespace.
 type CreateCodespaceParams struct {
-	RepositoryID           int
+	RepositoryID           int64
 	IdleTimeoutMinutes     int
 	RetentionPeriodMinutes *int
 	Branch                 string
@@ -744,7 +928,7 @@ func (a *API) CreateCodespace(ctx context.Context, params *CreateCodespaceParams
 }
 
 type startCreateRequest struct {
-	RepositoryID           int    `json:"repository_id"`
+	RepositoryID           int64  `json:"repository_id"`
 	IdleTimeoutMinutes     int    `json:"idle_timeout_minutes,omitempty"`
 	RetentionPeriodMinutes *int   `json:"retention_period_minutes,omitempty"`
 	Ref                    string `json:"ref"`
@@ -795,7 +979,11 @@ func (a *API) startCreate(ctx context.Context, params *CreateCodespaceParams) (*
 		return nil, fmt.Errorf("error marshaling request: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, a.githubAPI+"/user/codespaces", bytes.NewBuffer(requestBody))
+	u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "user", "codespaces")
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewBuffer(requestBody))
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -815,7 +1003,7 @@ func (a *API) startCreate(ctx context.Context, params *CreateCodespaceParams) (*
 
 		var response Codespace
 		if err := json.Unmarshal(b, &response); err != nil {
-			return nil, fmt.Errorf("error unmarshaling response: %w", err)
+			return nil, fmt.Errorf("error unmarshalling response: %w", err)
 		}
 
 		return &response, errProvisioningInProgress // RPC finished before result of creation known
@@ -831,7 +1019,7 @@ func (a *API) startCreate(ctx context.Context, params *CreateCodespaceParams) (*
 			return nil, fmt.Errorf("error reading response body: %w", err)
 		}
 		if err := json.Unmarshal(b, &ue); err != nil {
-			return nil, fmt.Errorf("error unmarshaling response: %w", err)
+			return nil, fmt.Errorf("error unmarshalling response: %w", err)
 		}
 
 		if ue.AllowPermissionsURL != "" {
@@ -853,7 +1041,7 @@ func (a *API) startCreate(ctx context.Context, params *CreateCodespaceParams) (*
 
 	var response Codespace
 	if err := json.Unmarshal(b, &response); err != nil {
-		return nil, fmt.Errorf("error unmarshaling response: %w", err)
+		return nil, fmt.Errorf("error unmarshalling response: %w", err)
 	}
 
 	return &response, nil
@@ -861,18 +1049,22 @@ func (a *API) startCreate(ctx context.Context, params *CreateCodespaceParams) (*
 
 // DeleteCodespace deletes the given codespace.
 func (a *API) DeleteCodespace(ctx context.Context, codespaceName string, orgName string, userName string) error {
-	var deleteURL string
+	var deleteURL *safeurl.MutableSafeURL
 	var spanName string
+	var err error
 
 	if orgName != "" && userName != "" {
-		deleteURL = fmt.Sprintf("%s/orgs/%s/members/%s/codespaces/%s", a.githubAPI, orgName, userName, codespaceName)
+		deleteURL, err = safeurl.JoinPathWithHostPrefix(a.githubAPI, "orgs", orgName, "members", userName, "codespaces", codespaceName)
 		spanName = "/orgs/*/members/*/codespaces/*"
 	} else {
-		deleteURL = a.githubAPI + "/user/codespaces/" + codespaceName
+		deleteURL, err = safeurl.JoinPathWithHostPrefix(a.githubAPI, "user", "codespaces", codespaceName)
 		spanName = "/user/codespaces/*"
 	}
+	if err != nil {
+		return err
+	}
 
-	req, err := http.NewRequest(http.MethodDelete, deleteURL, nil)
+	req, err := http.NewRequest(http.MethodDelete, deleteURL.String(), nil)
 	if err != nil {
 		return fmt.Errorf("error creating request: %w", err)
 	}
@@ -898,21 +1090,24 @@ type DevContainerEntry struct {
 
 // ListDevContainers returns a list of valid devcontainer.json files for the repo. Pass a negative limit to request all pages from
 // the API until all devcontainer.json files have been fetched.
-func (a *API) ListDevContainers(ctx context.Context, repoID int, branch string, limit int) (devcontainers []DevContainerEntry, err error) {
+func (a *API) ListDevContainers(ctx context.Context, repoID int64, branch string, limit int) (devcontainers []DevContainerEntry, err error) {
 	perPage := 100
 	if limit > 0 && limit < 100 {
 		perPage = limit
 	}
 
-	v := url.Values{}
-	v.Set("per_page", strconv.Itoa(perPage))
-	if branch != "" {
-		v.Set("ref", branch)
+	u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "repositories", strconv.FormatInt(repoID, 10), "codespaces", "devcontainers")
+	if err != nil {
+		return nil, err
 	}
-	listURL := fmt.Sprintf("%s/repositories/%d/codespaces/devcontainers?%s", a.githubAPI, repoID, v.Encode())
+	u.SetQuery("per_page", strconv.Itoa(perPage))
+	if branch != "" {
+		u.SetQuery("ref", branch)
+	}
+	var listURL safeurl.SafeURL = u
 
 	for {
-		req, err := http.NewRequest(http.MethodGet, listURL, nil)
+		req, err := http.NewRequest(http.MethodGet, listURL.String(), nil)
 		if err != nil {
 			return nil, fmt.Errorf("error creating request: %w", err)
 		}
@@ -934,7 +1129,7 @@ func (a *API) ListDevContainers(ctx context.Context, repoID int, branch string, 
 
 		dec := json.NewDecoder(resp.Body)
 		if err := dec.Decode(&response); err != nil {
-			return nil, fmt.Errorf("error unmarshaling response: %w", err)
+			return nil, fmt.Errorf("error unmarshalling response: %w", err)
 		}
 
 		nextURL := findNextPage(resp.Header.Get("Link"))
@@ -949,9 +1144,9 @@ func (a *API) ListDevContainers(ctx context.Context, repoID int, branch string, 
 			q := u.Query()
 			q.Set("per_page", strconv.Itoa(newPerPage))
 			u.RawQuery = q.Encode()
-			listURL = u.String()
+			listURL = safeurl.NewImmutableSafeURL(u.String())
 		} else {
-			listURL = nextURL
+			listURL = safeurl.NewImmutableSafeURL(nextURL)
 		}
 	}
 
@@ -970,7 +1165,11 @@ func (a *API) EditCodespace(ctx context.Context, codespaceName string, params *E
 		return nil, fmt.Errorf("error marshaling request: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPatch, a.githubAPI+"/user/codespaces/"+codespaceName, bytes.NewBuffer(requestBody))
+	u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "user", "codespaces", codespaceName)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPatch, u.String(), bytes.NewBuffer(requestBody))
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -1007,7 +1206,7 @@ func (a *API) EditCodespace(ctx context.Context, codespaceName string, params *E
 
 	var response Codespace
 	if err := json.Unmarshal(b, &response); err != nil {
-		return nil, fmt.Errorf("error unmarshaling response: %w", err)
+		return nil, fmt.Errorf("error unmarshalling response: %w", err)
 	}
 
 	return &response, nil
@@ -1026,7 +1225,15 @@ type getCodespaceRepositoryContentsResponse struct {
 }
 
 func (a *API) GetCodespaceRepositoryContents(ctx context.Context, codespace *Codespace, path string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, a.githubAPI+"/repos/"+codespace.Repository.FullName+"/contents/"+path, nil)
+	owner, name, err := safeurl.RepoPartsFromNWO(codespace.Repository.FullName)
+	if err != nil {
+		return nil, err
+	}
+	u, err := safeurl.JoinPathWithHostPrefix(a.githubAPI, "repos", owner, name, "contents", path)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -1055,7 +1262,7 @@ func (a *API) GetCodespaceRepositoryContents(ctx context.Context, codespace *Cod
 
 	var response getCodespaceRepositoryContentsResponse
 	if err := json.Unmarshal(b, &response); err != nil {
-		return nil, fmt.Errorf("error unmarshaling response: %w", err)
+		return nil, fmt.Errorf("error unmarshalling response: %w", err)
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(response.Content)
@@ -1073,7 +1280,13 @@ func (a *API) do(ctx context.Context, req *http.Request, spanName string) (*http
 	span, ctx := opentracing.StartSpanFromContext(ctx, spanName)
 	defer span.Finish()
 	req = req.WithContext(ctx)
-	return a.client.Do(req)
+
+	httpClient, err := a.client()
+	if err != nil {
+		return nil, err
+	}
+
+	return httpClient.Do(req)
 }
 
 // setHeaders sets the required headers for the API.
@@ -1093,6 +1306,12 @@ func (a *API) withRetry(f func() (*http.Response, error)) (*http.Response, error
 		if resp.StatusCode < 500 {
 			return resp, nil
 		}
-		return nil, errors.New("retry")
+		return nil, fmt.Errorf("received response with status code %d", resp.StatusCode)
 	}, backoff.WithMaxRetries(bo, 3))
+}
+
+// ExternalHTTPClient returns an HTTP client for requests to non-GitHub hosts.
+// It must not carry GitHub authentication credentials.
+func (a *API) ExternalHTTPClient() (*http.Client, error) {
+	return a.externalClient()
 }

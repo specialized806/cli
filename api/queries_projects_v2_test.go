@@ -11,6 +11,7 @@ import (
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/pkg/httpmock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestUpdateProjectV2Items(t *testing.T) {
@@ -25,7 +26,7 @@ func TestUpdateProjectV2Items(t *testing.T) {
 				reg.Register(
 					httpmock.GraphQL(`mutation UpdateProjectV2Items\b`),
 					httpmock.GraphQLQuery(`{"data":{"add_000":{"item":{"id":"1"}},"delete_001":{"item":{"id":"2"}}}}`,
-						func(mutations string, inputs map[string]interface{}) {
+						func(mutations string, inputs map[string]any) {
 							expectedMutations := `
                 mutation UpdateProjectV2Items(
                   $input_000: AddProjectV2ItemByIdInput!
@@ -42,10 +43,10 @@ func TestUpdateProjectV2Items(t *testing.T) {
 							if len(inputs) != 4 {
 								t.Fatalf("expected 4 inputs, got %d", len(inputs))
 							}
-							i0 := inputs["input_000"].(map[string]interface{})
-							i1 := inputs["input_001"].(map[string]interface{})
-							i2 := inputs["input_002"].(map[string]interface{})
-							i3 := inputs["input_003"].(map[string]interface{})
+							i0 := inputs["input_000"].(map[string]any)
+							i1 := inputs["input_001"].(map[string]any)
+							i2 := inputs["input_002"].(map[string]any)
+							i3 := inputs["input_003"].(map[string]any)
 							adds := []string{
 								fmt.Sprintf("%v -> %v", i0["contentId"], i0["projectId"]),
 								fmt.Sprintf("%v -> %v", i1["contentId"], i1["projectId"]),
@@ -66,7 +67,7 @@ func TestUpdateProjectV2Items(t *testing.T) {
 			httpStubs: func(reg *httpmock.Registry) {
 				reg.Register(
 					httpmock.GraphQL(`mutation UpdateProjectV2Items\b`),
-					httpmock.GraphQLMutation(`{"data":{}, "errors": [{"message": "some gql error"}]}`, func(inputs map[string]interface{}) {}),
+					httpmock.GraphQLMutation(`{"data":{}, "errors": [{"message": "some gql error"}]}`, func(inputs map[string]any) {}),
 				)
 			},
 			expectError: true,
@@ -107,7 +108,7 @@ func TestProjectsV2ItemsForIssue(t *testing.T) {
 				reg.Register(
 					httpmock.GraphQL(`query IssueProjectItems\b`),
 					httpmock.GraphQLQuery(`{"data":{"repository":{"issue":{"projectItems":{"nodes": [{"id":"projectItem1"},{"id":"projectItem2"}]}}}}}`,
-						func(query string, inputs map[string]interface{}) {}),
+						func(query string, inputs map[string]any) {}),
 				)
 			},
 			expectItems: ProjectItems{
@@ -123,10 +124,21 @@ func TestProjectsV2ItemsForIssue(t *testing.T) {
 				reg.Register(
 					httpmock.GraphQL(`query IssueProjectItems\b`),
 					httpmock.GraphQLQuery(`{"data":{}, "errors": [{"message": "some gql error"}]}`,
-						func(query string, inputs map[string]interface{}) {}),
+						func(query string, inputs map[string]any) {}),
 				)
 			},
 			expectError: true,
+		},
+		{
+			name: "skips null project items for issue",
+			httpStubs: func(reg *httpmock.Registry) {
+				reg.Register(
+					httpmock.GraphQL(`query IssueProjectItems\b`),
+					httpmock.GraphQLQuery(`{"data":{"repository":{"issue":{"projectItems":{"totalCount":1,"nodes":[null]}}}}}`,
+						func(query string, inputs map[string]any) {}),
+				)
+			},
+			expectItems: ProjectItems{},
 		},
 	}
 
@@ -164,7 +176,7 @@ func TestProjectsV2ItemsForPullRequest(t *testing.T) {
 				reg.Register(
 					httpmock.GraphQL(`query PullRequestProjectItems\b`),
 					httpmock.GraphQLQuery(`{"data":{"repository":{"pullRequest":{"projectItems":{"nodes": [{"id":"projectItem3"},{"id":"projectItem4"}]}}}}}`,
-						func(query string, inputs map[string]interface{}) {}),
+						func(query string, inputs map[string]any) {}),
 				)
 			},
 			expectItems: ProjectItems{
@@ -180,10 +192,76 @@ func TestProjectsV2ItemsForPullRequest(t *testing.T) {
 				reg.Register(
 					httpmock.GraphQL(`query PullRequestProjectItems\b`),
 					httpmock.GraphQLQuery(`{"data":{}, "errors": [{"message": "some gql error"}]}`,
-						func(query string, inputs map[string]interface{}) {}),
+						func(query string, inputs map[string]any) {}),
 				)
 			},
 			expectError: true,
+		},
+		{
+			name: "skips null project items for pull request",
+			httpStubs: func(reg *httpmock.Registry) {
+				reg.Register(
+					httpmock.GraphQL(`query PullRequestProjectItems\b`),
+					httpmock.GraphQLQuery(`{"data":{"repository":{"pullRequest":{"projectItems":{"totalCount":1,"nodes":[null]}}}}}`,
+						func(query string, inputs map[string]any) {}),
+				)
+			},
+			expectItems: ProjectItems{},
+		},
+		{
+			name: "retrieves project items that have status columns",
+			httpStubs: func(reg *httpmock.Registry) {
+				reg.Register(
+					httpmock.GraphQL(`query PullRequestProjectItems\b`),
+					httpmock.GraphQLQuery(`{
+                        "data": {
+                          "repository": {
+                            "pullRequest": {
+                              "projectItems": {
+                                "nodes": [
+                                  {
+                                    "id": "PVTI_lADOB-vozM4AVk16zgK6U50",
+                                    "project": {
+                                      "id": "PVT_kwDOB-vozM4AVk16",
+                                      "title": "Test Project"
+                                    },
+                                    "status": {
+                                      "optionId": "47fc9ee4",
+                                      "name": "In Progress"
+                                    }
+                                  }
+                                ],
+                                "pageInfo": {
+                                  "hasNextPage": false,
+                                  "endCursor": "MQ"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }`,
+						func(query string, inputs map[string]any) {
+							require.Equal(t, float64(1), inputs["number"])
+							require.Equal(t, "OWNER", inputs["owner"])
+							require.Equal(t, "REPO", inputs["name"])
+						}),
+				)
+			},
+			expectItems: ProjectItems{
+				Nodes: []*ProjectV2Item{
+					{
+						ID: "PVTI_lADOB-vozM4AVk16zgK6U50",
+						Project: ProjectV2ItemProject{
+							ID:    "PVT_kwDOB-vozM4AVk16",
+							Title: "Test Project",
+						},
+						Status: ProjectV2ItemStatus{
+							OptionID: "47fc9ee4",
+							Name:     "In Progress",
+						},
+					},
+				},
+			},
 		},
 	}
 
@@ -199,11 +277,11 @@ func TestProjectsV2ItemsForPullRequest(t *testing.T) {
 			pr := &PullRequest{Number: 1}
 			err := ProjectsV2ItemsForPullRequest(client, repo, pr)
 			if tt.expectError {
-				assert.Error(t, err)
+				require.Error(t, err)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 			}
-			assert.Equal(t, tt.expectItems, pr.ProjectItems)
+			require.Equal(t, tt.expectItems, pr.ProjectItems)
 		})
 	}
 }
@@ -237,6 +315,21 @@ func TestProjectsV2IgnorableError(t *testing.T) {
 		{
 			name:      "pullRequest projectItems field error",
 			errMsg:    "Field 'projectItems' doesn't exist on type 'PullRequest'",
+			expectOut: true,
+		},
+		{
+			name:      "resource not accessible by integration",
+			errMsg:    "Resource not accessible by integration",
+			expectOut: true,
+		},
+		{
+			name:      "resource not accessible by personal access token",
+			errMsg:    "Resource not accessible by personal access token",
+			expectOut: true,
+		},
+		{
+			name:      "resource not accessible by integration with path context",
+			errMsg:    "GraphQL: Resource not accessible by integration (repository.pullRequest.projectItems.nodes.0)",
 			expectOut: true,
 		},
 		{

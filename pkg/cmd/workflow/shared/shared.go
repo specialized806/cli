@@ -1,19 +1,23 @@
 package shared
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"net/url"
+	"io"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/safeurl"
+	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
+	"github.com/cli/go-gh/v2/pkg/asciisanitizer"
+	"golang.org/x/text/transform"
 )
 
 const (
@@ -21,6 +25,10 @@ const (
 	DisabledManually   WorkflowState = "disabled_manually"
 	DisabledInactivity WorkflowState = "disabled_inactivity"
 )
+
+type iprompter interface {
+	Select(string, string, []string) (int, error)
+}
 
 type WorkflowState string
 
@@ -43,6 +51,10 @@ func (w *Workflow) Base() string {
 	return path.Base(w.Path)
 }
 
+func (w *Workflow) ExportData(fields []string) map[string]any {
+	return cmdutil.StructExportData(w, fields)
+}
+
 func GetWorkflows(client *api.Client, repo ghrepo.Interface, limit int) ([]Workflow, error) {
 	perPage := limit
 	page := 1
@@ -58,9 +70,14 @@ func GetWorkflows(client *api.Client, repo ghrepo.Interface, limit int) ([]Workf
 		}
 		var result WorkflowsPayload
 
-		path := fmt.Sprintf("repos/%s/actions/workflows?per_page=%d&page=%d", ghrepo.FullName(repo), perPage, page)
+		u, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "workflows")
+		if err != nil {
+			return nil, err
+		}
+		u.SetQuery("per_page", strconv.Itoa(perPage))
+		u.SetQuery("page", strconv.Itoa(page))
 
-		err := client.REST(repo.RepoHost(), "GET", path, nil, &result)
+		err = client.REST(repo.RepoHost(), "GET", u.String(), nil, &result)
 		if err != nil {
 			return nil, err
 		}
@@ -86,16 +103,13 @@ type FilteredAllError struct {
 	error
 }
 
-func SelectWorkflow(workflows []Workflow, promptMsg string, states []WorkflowState) (*Workflow, error) {
+func selectWorkflow(p iprompter, workflows []Workflow, promptMsg string, states []WorkflowState) (*Workflow, error) {
 	filtered := []Workflow{}
 	candidates := []string{}
 	for _, workflow := range workflows {
-		for _, state := range states {
-			if workflow.State == state {
-				filtered = append(filtered, workflow)
-				candidates = append(candidates, fmt.Sprintf("%s (%s)", workflow.Name, workflow.Base()))
-				break
-			}
+		if slices.Contains(states, workflow.State) {
+			filtered = append(filtered, workflow)
+			candidates = append(candidates, fmt.Sprintf("%s (%s)", workflow.Name, workflow.Base()))
 		}
 	}
 
@@ -103,14 +117,7 @@ func SelectWorkflow(workflows []Workflow, promptMsg string, states []WorkflowSta
 		return nil, FilteredAllError{errors.New("")}
 	}
 
-	var selected int
-
-	//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-	err := prompt.SurveyAskOne(&survey.Select{
-		Message:  promptMsg,
-		Options:  candidates,
-		PageSize: 15,
-	}, &selected)
+	selected, err := p.Select(promptMsg, "", candidates)
 	if err != nil {
 		return nil, err
 	}
@@ -127,6 +134,12 @@ func FindWorkflow(client *api.Client, repo ghrepo.Interface, workflowSelector st
 	if _, err := strconv.Atoi(workflowSelector); err == nil || isWorkflowFile(workflowSelector) {
 		workflow, err := getWorkflowByID(client, repo, workflowSelector)
 		if err != nil {
+			if httpErr, ok := errors.AsType[api.HTTPError](err); ok {
+				if httpErr.StatusCode == 404 {
+					httpErr.Message = fmt.Sprintf("workflow %s not found on the default branch", workflowSelector)
+				}
+				return nil, httpErr
+			}
 			return nil, err
 		}
 		return []Workflow{*workflow}, nil
@@ -148,8 +161,11 @@ func isWorkflowFile(f string) bool {
 func getWorkflowByID(client *api.Client, repo ghrepo.Interface, ID string) (*Workflow, error) {
 	var workflow Workflow
 
-	path := fmt.Sprintf("repos/%s/actions/workflows/%s", ghrepo.FullName(repo), url.PathEscape(ID))
-	if err := client.REST(repo.RepoHost(), "GET", path, nil, &workflow); err != nil {
+	path, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "workflows", ID)
+	if err != nil {
+		return nil, err
+	}
+	if err := client.REST(repo.RepoHost(), "GET", path.String(), nil, &workflow); err != nil {
 		return nil, err
 	}
 
@@ -167,18 +183,15 @@ func getWorkflowsByName(client *api.Client, repo ghrepo.Interface, name string, 
 		if !strings.EqualFold(workflow.Name, name) {
 			continue
 		}
-		for _, state := range states {
-			if workflow.State == state {
-				filtered = append(filtered, workflow)
-				break
-			}
+		if slices.Contains(states, workflow.State) {
+			filtered = append(filtered, workflow)
 		}
 	}
 
 	return filtered, nil
 }
 
-func ResolveWorkflow(io *iostreams.IOStreams, client *api.Client, repo ghrepo.Interface, prompt bool, workflowSelector string, states []WorkflowState) (*Workflow, error) {
+func ResolveWorkflow(p iprompter, io *iostreams.IOStreams, client *api.Client, repo ghrepo.Interface, prompt bool, workflowSelector string, states []WorkflowState) (*Workflow, error) {
 	if prompt {
 		workflows, err := GetWorkflows(client, repo, 0)
 		if len(workflows) == 0 {
@@ -194,7 +207,7 @@ func ResolveWorkflow(io *iostreams.IOStreams, client *api.Client, repo ghrepo.In
 			return nil, fmt.Errorf("could not fetch workflows for %s: %w", ghrepo.FullName(repo), err)
 		}
 
-		return SelectWorkflow(workflows, "Select a workflow", states)
+		return selectWorkflow(p, workflows, "Select a workflow", states)
 	}
 
 	workflows, err := FindWorkflow(client, repo, workflowSelector, states)
@@ -211,21 +224,24 @@ func ResolveWorkflow(io *iostreams.IOStreams, client *api.Client, repo ghrepo.In
 	}
 
 	if !io.CanPrompt() {
-		errMsg := "could not resolve to a unique workflow; found:"
+		var errMsg strings.Builder
+		errMsg.WriteString("could not resolve to a unique workflow; found:")
 		for _, workflow := range workflows {
-			errMsg += fmt.Sprintf(" %s", workflow.Base())
+			errMsg.WriteString(fmt.Sprintf(" %s", workflow.Base()))
 		}
-		return nil, errors.New(errMsg)
+		return nil, errors.New(errMsg.String())
 	}
 
-	return SelectWorkflow(workflows, "Which workflow do you mean?", states)
+	return selectWorkflow(p, workflows, "Which workflow do you mean?", states)
 }
 
 func GetWorkflowContent(client *api.Client, repo ghrepo.Interface, workflow Workflow, ref string) ([]byte, error) {
-	path := fmt.Sprintf("repos/%s/contents/%s", ghrepo.FullName(repo), workflow.Path)
+	path, err := safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "contents", workflow.Path)
+	if err != nil {
+		return nil, err
+	}
 	if ref != "" {
-		q := fmt.Sprintf("?ref=%s", url.QueryEscape(ref))
-		path = path + q
+		path.SetQuery("ref", ref)
 	}
 
 	type Result struct {
@@ -233,7 +249,7 @@ func GetWorkflowContent(client *api.Client, repo ghrepo.Interface, workflow Work
 	}
 
 	var result Result
-	err := client.REST(repo.RepoHost(), "GET", path, nil, &result)
+	err = client.REST(repo.RepoHost(), "GET", path.String(), nil, &result)
 	if err != nil {
 		return nil, err
 	}
@@ -243,5 +259,10 @@ func GetWorkflowContent(client *api.Client, repo ghrepo.Interface, workflow Work
 		return nil, fmt.Errorf("failed to decode workflow file: %w", err)
 	}
 
-	return decoded, nil
+	sanitized, err := io.ReadAll(transform.NewReader(bytes.NewReader(decoded), &asciisanitizer.Sanitizer{}))
+	if err != nil {
+		return nil, err
+	}
+
+	return sanitized, nil
 }

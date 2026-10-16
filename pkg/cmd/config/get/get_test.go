@@ -5,10 +5,12 @@ import (
 	"testing"
 
 	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewCmdConfigGet(t *testing.T) {
@@ -41,8 +43,8 @@ func TestNewCmdConfigGet(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := &cmdutil.Factory{
-				Config: func() (config.Config, error) {
-					return config.NewBlankConfig(), nil
+				Config: func() (gh.Config, error) {
+					return config.NewMockConfig(), nil
 				},
 			}
 
@@ -76,18 +78,17 @@ func TestNewCmdConfigGet(t *testing.T) {
 
 func Test_getRun(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   *GetOptions
-		stdout  string
-		stderr  string
-		wantErr bool
+		name   string
+		input  *GetOptions
+		stdout string
+		err    error
 	}{
 		{
 			name: "get key",
 			input: &GetOptions{
 				Key: "editor",
-				Config: func() config.Config {
-					cfg := config.NewBlankConfig()
+				Config: func() gh.Config {
+					cfg := config.NewMockConfig()
 					cfg.Set("", "editor", "ed")
 					return cfg
 				}(),
@@ -99,8 +100,8 @@ func Test_getRun(t *testing.T) {
 			input: &GetOptions{
 				Hostname: "github.com",
 				Key:      "editor",
-				Config: func() config.Config {
-					cfg := config.NewBlankConfig()
+				Config: func() gh.Config {
+					cfg := config.NewMockConfig()
 					cfg.Set("", "editor", "ed")
 					cfg.Set("github.com", "editor", "vim")
 					return cfg
@@ -108,17 +109,24 @@ func Test_getRun(t *testing.T) {
 			},
 			stdout: "vim\n",
 		},
+		{
+			name: "non-existent key",
+			input: &GetOptions{
+				Key:    "non-existent",
+				Config: config.NewMockConfig(),
+			},
+			err: nonExistentKeyError{key: "non-existent"},
+		},
 	}
 
 	for _, tt := range tests {
-		ios, _, stdout, stderr := iostreams.Test()
+		ios, _, stdout, _ := iostreams.Test()
 		tt.input.IO = ios
 
 		t.Run(tt.name, func(t *testing.T) {
 			err := getRun(tt.input)
-			assert.NoError(t, err)
-			assert.Equal(t, tt.stdout, stdout.String())
-			assert.Equal(t, tt.stderr, stderr.String())
+			require.Equal(t, err, tt.err)
+			require.Equal(t, tt.stdout, stdout.String())
 		})
 	}
 }

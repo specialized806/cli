@@ -6,8 +6,9 @@ import (
 	"net/http"
 
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/git"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/safeurl"
 	"github.com/cli/cli/v2/pkg/cmd/release/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -19,10 +20,12 @@ type iprompter interface {
 }
 
 type DeleteOptions struct {
-	HttpClient func() (*http.Client, error)
-	IO         *iostreams.IOStreams
-	BaseRepo   func() (ghrepo.Interface, error)
-	Prompter   iprompter
+	HttpClient   func() (*http.Client, error)
+	GitClient    *git.Client
+	IO           *iostreams.IOStreams
+	BaseRepo     func() (ghrepo.Interface, error)
+	RepoOverride string
+	Prompter     iprompter
 
 	TagName     string
 	SkipConfirm bool
@@ -33,6 +36,7 @@ func NewCmdDelete(f *cmdutil.Factory, runF func(*DeleteOptions) error) *cobra.Co
 	opts := &DeleteOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
+		GitClient:  f.GitClient,
 		Prompter:   f.Prompter,
 	}
 
@@ -43,6 +47,7 @@ func NewCmdDelete(f *cmdutil.Factory, runF func(*DeleteOptions) error) *cobra.Co
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// support `-R, --repo` override
 			opts.BaseRepo = f.BaseRepo
+			opts.RepoOverride, _ = cmd.Flags().GetString("repo")
 
 			opts.TagName = args[0]
 
@@ -87,17 +92,18 @@ func deleteRun(opts *DeleteOptions) error {
 		}
 	}
 
-	err = deleteRelease(httpClient, release.APIURL)
+	err = deleteRelease(httpClient, baseRepo.RepoHost(), safeurl.NewImmutableSafeURL(release.APIURL))
 	if err != nil {
 		return err
 	}
 
 	var cleanupMessage string
-	mustCleanupTag := opts.CleanupTag
-	if mustCleanupTag {
-		err = deleteTag(httpClient, baseRepo, release.TagName)
-		if err != nil {
+	if opts.CleanupTag {
+		if err := deleteTag(httpClient, baseRepo, release.TagName); err != nil {
 			return err
+		}
+		if opts.RepoOverride == "" {
+			_ = opts.GitClient.DeleteLocalTag(context.Background(), release.TagName)
 		}
 		cleanupMessage = " and tag"
 	}
@@ -108,48 +114,27 @@ func deleteRun(opts *DeleteOptions) error {
 
 	iofmt := opts.IO.ColorScheme()
 	fmt.Fprintf(opts.IO.ErrOut, "%s Deleted release%s %s\n", iofmt.SuccessIconWithColor(iofmt.Red), cleanupMessage, release.TagName)
-	if !release.IsDraft && !mustCleanupTag {
+	if !release.IsDraft && !opts.CleanupTag {
 		fmt.Fprintf(opts.IO.ErrOut, "%s Note that the %s git tag still remains in the repository\n", iofmt.WarningIcon(), release.TagName)
 	}
 
 	return nil
 }
 
-func deleteRelease(httpClient *http.Client, releaseURL string) error {
-	req, err := http.NewRequest("DELETE", releaseURL, nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode > 299 {
-		return api.HandleHTTPError(resp)
-	}
-	return nil
+func deleteRelease(httpClient *http.Client, host string, releaseURL safeurl.SafeURL) error {
+	// TODO(api-client-rollout)
+	// This line of code is part of a mechanical roll out of the api client.
+	// As a follow up, consider whether the api client can be injected to this call site, rather than constructed
+	return api.NewClientFromHTTP(httpClient).REST(host, http.MethodDelete, releaseURL.String(), nil, nil)
 }
 
 func deleteTag(httpClient *http.Client, baseRepo ghrepo.Interface, tagName string) error {
-	path := fmt.Sprintf("repos/%s/%s/git/refs/tags/%s", baseRepo.RepoOwner(), baseRepo.RepoName(), tagName)
-	url := ghinstance.RESTPrefix(baseRepo.RepoHost()) + path
-
-	req, err := http.NewRequest("DELETE", url, nil)
+	path, err := safeurl.JoinPath("repos", baseRepo.RepoOwner(), baseRepo.RepoName(), "git", "refs", fmt.Sprintf("tags/%s", tagName))
 	if err != nil {
 		return err
 	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode > 299 {
-		return api.HandleHTTPError(resp)
-	}
-	return nil
+	// TODO(api-client-rollout)
+	// This line of code is part of a mechanical roll out of the api client.
+	// As a follow up, consider whether the api client can be injected to this call site, rather than constructed
+	return api.NewClientFromHTTP(httpClient).REST(baseRepo.RepoHost(), http.MethodDelete, path.String(), nil, nil)
 }

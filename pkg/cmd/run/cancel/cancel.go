@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/safeurl"
 	"github.com/cli/cli/v2/pkg/cmd/run/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -17,16 +19,19 @@ type CancelOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
+	Prompter   shared.Prompter
 
 	Prompt bool
 
 	RunID string
+	Force bool
 }
 
 func NewCmdCancel(f *cmdutil.Factory, runF func(*CancelOptions) error) *cobra.Command {
 	opts := &CancelOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
+		Prompter:   f.Prompter,
 	}
 
 	cmd := &cobra.Command{
@@ -53,10 +58,18 @@ func NewCmdCancel(f *cmdutil.Factory, runF func(*CancelOptions) error) *cobra.Co
 		},
 	}
 
+	cmd.Flags().BoolVar(&opts.Force, "force", false, "Force cancel a workflow run")
+
 	return cmd
 }
 
 func runCancel(opts *CancelOptions) error {
+	if opts.RunID != "" {
+		_, err := strconv.Atoi(opts.RunID)
+		if err != nil {
+			return fmt.Errorf("invalid run-id %#v", opts.RunID)
+		}
+	}
 	httpClient, err := opts.HttpClient()
 	if err != nil {
 		return fmt.Errorf("failed to create http client: %w", err)
@@ -83,11 +96,10 @@ func runCancel(opts *CancelOptions) error {
 		if len(runs) == 0 {
 			return fmt.Errorf("found no in progress runs to cancel")
 		}
-		runID, err = shared.PromptForRun(cs, runs)
-		if err != nil {
+		if runID, err = shared.SelectRun(opts.Prompter, cs, runs); err != nil {
 			return err
 		}
-		// TODO silly stopgap until dust settles and PromptForRun can just return a run
+		// TODO silly stopgap until dust settles and SelectRun can just return a run
 		for _, r := range runs {
 			if fmt.Sprintf("%d", r.ID) == runID {
 				run = &r
@@ -97,8 +109,7 @@ func runCancel(opts *CancelOptions) error {
 	} else {
 		run, err = shared.GetRun(client, repo, runID, 0)
 		if err != nil {
-			var httpErr api.HTTPError
-			if errors.As(err, &httpErr) {
+			if httpErr, ok := errors.AsType[api.HTTPError](err); ok {
 				if httpErr.StatusCode == http.StatusNotFound {
 					err = fmt.Errorf("Could not find any workflow run with ID %s", opts.RunID)
 				}
@@ -107,10 +118,11 @@ func runCancel(opts *CancelOptions) error {
 		}
 	}
 
-	err = cancelWorkflowRun(client, repo, fmt.Sprintf("%d", run.ID))
+	force := opts.Force
+
+	err = cancelWorkflowRun(client, repo, fmt.Sprintf("%d", run.ID), force)
 	if err != nil {
-		var httpErr api.HTTPError
-		if errors.As(err, &httpErr) {
+		if httpErr, ok := errors.AsType[api.HTTPError](err); ok {
 			if httpErr.StatusCode == http.StatusConflict {
 				err = fmt.Errorf("Cannot cancel a workflow run that is completed")
 			}
@@ -119,15 +131,28 @@ func runCancel(opts *CancelOptions) error {
 		return err
 	}
 
-	fmt.Fprintf(opts.IO.Out, "%s Request to cancel workflow submitted.\n", cs.SuccessIcon())
+	if force {
+		fmt.Fprintf(opts.IO.Out, "%s Request to force cancel workflow %s submitted.\n", cs.SuccessIcon(), runID)
+	} else {
+		fmt.Fprintf(opts.IO.Out, "%s Request to cancel workflow %s submitted.\n", cs.SuccessIcon(), runID)
+	}
 
 	return nil
 }
 
-func cancelWorkflowRun(client *api.Client, repo ghrepo.Interface, runID string) error {
-	path := fmt.Sprintf("repos/%s/actions/runs/%s/cancel", ghrepo.FullName(repo), runID)
+func cancelWorkflowRun(client *api.Client, repo ghrepo.Interface, runID string, force bool) error {
+	var path *safeurl.MutableSafeURL
+	var err error
+	if force {
+		path, err = safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "runs", runID, "force-cancel")
+	} else {
+		path, err = safeurl.JoinPath("repos", repo.RepoOwner(), repo.RepoName(), "actions", "runs", runID, "cancel")
+	}
+	if err != nil {
+		return err
+	}
 
-	err := client.REST(repo.RepoHost(), "POST", path, nil, nil)
+	err = client.REST(repo.RepoHost(), "POST", path.String(), nil, nil)
 	if err != nil {
 		return err
 	}

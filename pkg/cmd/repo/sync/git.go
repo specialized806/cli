@@ -2,16 +2,14 @@ package sync
 
 import (
 	"context"
-	"fmt"
-	"strings"
 
 	"github.com/cli/cli/v2/git"
 )
 
 type gitClient interface {
-	BranchRemote(string) (string, error)
 	CurrentBranch() (string, error)
 	UpdateBranch(string, string) error
+	Worktrees() ([]git.Worktree, error)
 	CreateBranch(string, string, string) error
 	Fetch(string, string) error
 	HasLocalBranch(string) bool
@@ -25,27 +23,20 @@ type gitExecuter struct {
 	client *git.Client
 }
 
-func (g *gitExecuter) BranchRemote(branch string) (string, error) {
-	args := []string{"rev-parse", "--symbolic-full-name", "--abbrev-ref", fmt.Sprintf("%s@{u}", branch)}
-	cmd, err := g.client.Command(context.Background(), args...)
-	if err != nil {
-		return "", err
-	}
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	parts := strings.SplitN(string(out), "/", 2)
-	return parts[0], nil
-}
-
+// UpdateBranch moves branch to ref. It uses `git branch --force` rather than
+// `git update-ref` because update-ref will happily move a branch that is checked out in
+// another worktree, leaving that worktree's index and working tree stale.
 func (g *gitExecuter) UpdateBranch(branch, ref string) error {
-	cmd, err := g.client.Command(context.Background(), "update-ref", fmt.Sprintf("refs/heads/%s", branch), ref)
+	cmd, err := g.client.Command(context.Background(), "branch", "--force", "--", branch, ref)
 	if err != nil {
 		return err
 	}
 	_, err = cmd.Output()
 	return err
+}
+
+func (g *gitExecuter) Worktrees() ([]git.Worktree, error) {
+	return g.client.Worktrees(context.Background())
 }
 
 func (g *gitExecuter) CreateBranch(branch, ref, upstream string) error {
@@ -71,7 +62,7 @@ func (g *gitExecuter) CurrentBranch() (string, error) {
 
 func (g *gitExecuter) Fetch(remote, ref string) error {
 	args := []string{"fetch", "-q", remote, ref}
-	cmd, err := g.client.AuthenticatedCommand(context.Background(), args...)
+	cmd, err := g.client.AuthenticatedCommand(context.Background(), git.AllMatchingCredentialsPattern, args...)
 	if err != nil {
 		return err
 	}

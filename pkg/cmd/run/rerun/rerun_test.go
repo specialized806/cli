@@ -8,12 +8,13 @@ import (
 	"testing"
 
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/prompter"
 	"github.com/cli/cli/v2/pkg/cmd/run/shared"
 	workflowShared "github.com/cli/cli/v2/pkg/cmd/workflow/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/httpmock"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
+	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
 )
@@ -78,10 +79,13 @@ func TestNewCmdRerun(t *testing.T) {
 			},
 		},
 		{
-			name:     "with args jobID and runID fails",
-			tty:      true,
-			cli:      "1234 --job 5678",
-			wantsErr: true,
+			name: "with args jobID and runID uses jobID",
+			tty:  true,
+			cli:  "1234 --job 5678",
+			wants: RerunOptions{
+				JobID: "5678",
+				RunID: "",
+			},
 		},
 		{
 			name:     "with arg job with no ID fails",
@@ -161,15 +165,15 @@ func TestNewCmdRerun(t *testing.T) {
 
 func TestRerun(t *testing.T) {
 	tests := []struct {
-		name      string
-		httpStubs func(*httpmock.Registry)
-		askStubs  func(*prompt.AskStubber)
-		opts      *RerunOptions
-		tty       bool
-		wantErr   bool
-		errOut    string
-		wantOut   string
-		wantDebug bool
+		name        string
+		httpStubs   func(*httpmock.Registry)
+		promptStubs func(*prompter.MockPrompter)
+		opts        *RerunOptions
+		tty         bool
+		wantErr     bool
+		errOut      string
+		wantOut     string
+		wantDebug   bool
 	}{
 		{
 			name: "arg",
@@ -336,9 +340,12 @@ func TestRerun(t *testing.T) {
 					httpmock.REST("POST", "repos/OWNER/REPO/actions/runs/1234/rerun"),
 					httpmock.StringResponse("{}"))
 			},
-			askStubs: func(as *prompt.AskStubber) {
-				//nolint:staticcheck // SA1019: as.StubOne is deprecated: use StubPrompt
-				as.StubOne(2)
+			promptStubs: func(pm *prompter.MockPrompter) {
+				pm.RegisterSelect("Select a workflow run",
+					[]string{"X cool commit, CI [trunk] Feb 23, 2021", "X cool commit, CI [trunk] Feb 23, 2021", "X cool commit, CI [trunk] Feb 23, 2021", "- cool commit, CI [trunk] Feb 23, 2021", "- cool commit, CI [trunk] Feb 23, 2021", "X cool commit, CI [trunk] Feb 23, 2021"},
+					func(_, _ string, opts []string) (int, error) {
+						return 2, nil
+					})
 			},
 			wantOut: "✓ Requested rerun of run 1234\n",
 		},
@@ -368,7 +375,7 @@ func TestRerun(t *testing.T) {
 			errOut:  "no recent runs have failed; please specify a specific `<run-id>`",
 		},
 		{
-			name: "unrerunnable",
+			name: "API error (403)",
 			tty:  true,
 			opts: &RerunOptions{
 				RunID: "3",
@@ -386,10 +393,42 @@ func TestRerun(t *testing.T) {
 					}))
 				reg.Register(
 					httpmock.REST("POST", "repos/OWNER/REPO/actions/runs/3/rerun"),
-					httpmock.StatusStringResponse(403, "no"))
+					httpmock.JSONErrorResponse(403, api.HTTPError{
+						StatusCode: 403,
+						Message:    "blah blah",
+					}),
+				)
 			},
 			wantErr: true,
-			errOut:  "run 3 cannot be rerun; its workflow file may be broken",
+			errOut:  "run 3 cannot be rerun; blah blah",
+		},
+		{
+			name: "API error (non-403)",
+			tty:  true,
+			opts: &RerunOptions{
+				RunID: "3",
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/runs/3"),
+					httpmock.JSONResponse(shared.SuccessfulRun))
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows/123"),
+					httpmock.JSONResponse(workflowShared.WorkflowsPayload{
+						Workflows: []workflowShared.Workflow{
+							shared.TestWorkflow,
+						},
+					}))
+				reg.Register(
+					httpmock.REST("POST", "repos/OWNER/REPO/actions/runs/3/rerun"),
+					httpmock.JSONErrorResponse(500, api.HTTPError{
+						StatusCode: 500,
+						Message:    "blah blah",
+					}),
+				)
+			},
+			wantErr: true,
+			errOut:  "failed to rerun: HTTP 500: blah blah (https://api.github.com/repos/OWNER/REPO/actions/runs/3/rerun)",
 		},
 	}
 
@@ -408,11 +447,10 @@ func TestRerun(t *testing.T) {
 			return ghrepo.FromFullName("OWNER/REPO")
 		}
 
-		//nolint:staticcheck // SA1019: prompt.InitAskStubber is deprecated: use NewAskStubber
-		as, teardown := prompt.InitAskStubber()
-		defer teardown()
-		if tt.askStubs != nil {
-			tt.askStubs(as)
+		pm := prompter.NewMockPrompter(t)
+		tt.opts.Prompter = pm
+		if tt.promptStubs != nil {
+			tt.promptStubs(pm)
 		}
 
 		t.Run(tt.name, func(t *testing.T) {

@@ -3,10 +3,12 @@ package set
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/spf13/cobra"
@@ -14,7 +16,7 @@ import (
 
 type SetOptions struct {
 	IO     *iostreams.IOStreams
-	Config config.Config
+	Config gh.Config
 
 	Key      string
 	Value    string
@@ -33,6 +35,7 @@ func NewCmdConfigSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Co
 			$ gh config set editor vim
 			$ gh config set editor "code --wait"
 			$ gh config set git_protocol ssh --host github.com
+			$ gh config set api_host api-gateway.example.com --host example.com
 			$ gh config set prompt disabled
 		`),
 		Args: cobra.ExactArgs(2),
@@ -59,6 +62,10 @@ func NewCmdConfigSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Co
 }
 
 func setRun(opts *SetOptions) error {
+	if err := validateScope(opts.Key, opts.Hostname); err != nil {
+		return cmdutil.FlagErrorf("%s", err)
+	}
+
 	err := ValidateKey(opts.Key)
 	if err != nil {
 		warningIcon := opts.IO.ColorScheme().WarningIcon()
@@ -67,8 +74,7 @@ func setRun(opts *SetOptions) error {
 
 	err = ValidateValue(opts.Key, opts.Value)
 	if err != nil {
-		var invalidValue InvalidValueError
-		if errors.As(err, &invalidValue) {
+		if invalidValue, ok := errors.AsType[InvalidValueError](err); ok {
 			var values []string
 			for _, v := range invalidValue.ValidValues {
 				values = append(values, fmt.Sprintf("'%s'", v))
@@ -87,13 +93,30 @@ func setRun(opts *SetOptions) error {
 }
 
 func ValidateKey(key string) error {
-	for _, configKey := range config.ConfigOptions() {
+	for _, configKey := range config.Options {
 		if key == configKey.Key {
 			return nil
 		}
 	}
 
 	return fmt.Errorf("invalid key")
+}
+
+func validateScope(key, hostname string) error {
+	for _, configKey := range config.Options {
+		if key == configKey.Key {
+			switch {
+			case configKey.Scope == config.ConfigScopeHostOnly && hostname == "":
+				return fmt.Errorf("--host required when setting %s", key)
+			case configKey.Scope == config.ConfigScopeGlobalOnly && hostname != "":
+				return fmt.Errorf("--host cannot be used when setting %s", key)
+			default:
+				return nil
+			}
+		}
+	}
+
+	return nil
 }
 
 type InvalidValueError struct {
@@ -107,7 +130,7 @@ func (e InvalidValueError) Error() string {
 func ValidateValue(key, value string) error {
 	var validValues []string
 
-	for _, v := range config.ConfigOptions() {
+	for _, v := range config.Options {
 		if v.Key == key {
 			validValues = v.AllowedValues
 			break
@@ -118,10 +141,8 @@ func ValidateValue(key, value string) error {
 		return nil
 	}
 
-	for _, v := range validValues {
-		if v == value {
-			return nil
-		}
+	if slices.Contains(validValues, value) {
+		return nil
 	}
 
 	return InvalidValueError{ValidValues: validValues}
